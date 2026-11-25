@@ -99,6 +99,14 @@ version = "0.1.0"
 [[package]]
 name = "cco-proto"
 version = "0.1.0"
+dependencies = [
+ "base64",
+ "cco-crypto",
+ "hex",
+ "serde",
+ "serde_json",
+ "thiserror",
+]
 
 [[package]]
 name = "cco-transport"
