@@ -229,10 +229,12 @@ impl OverlayNode {
 
         let self_name = config.name.clone();
         let preconnect = config.preconnect;
+        // Deterministic initiator tie-breaking (self < peer) avoids simultaneous
+        // crossing MGMT handshakes overwriting each other's session IDs.
         let preconnect_peers: Vec<String> = config
             .peers
             .keys()
-            .filter(|p| p.as_str() != self_name.as_str())
+            .filter(|p| p.as_str() > self_name.as_str())
             .cloned()
             .collect();
 
@@ -556,7 +558,17 @@ async fn dispatch_actions(shared: Arc<SharedTransport>, actions: Vec<MccAction>)
                 message_type,
                 payload,
             } => {
-                if let Err(err) =
+                if peer == shared.self_name {
+                    // Repeated adjacent logical role (e.g. X2 == B in F4 model):
+                    // consume locally without UDP self-send (mcc_privacy.py::_opaque_send).
+                    let follow = shared.machine.lock().await.on_inbound(
+                        &shared.self_name,
+                        message_type,
+                        &payload,
+                        now_ms(),
+                    );
+                    queue.extend(follow);
+                } else if let Err(err) =
                     send_link_encrypted(Arc::clone(&shared), &peer, message_type, payload).await
                 {
                     warn!(peer, error = %err, "overlay send failed");
@@ -678,7 +690,9 @@ async fn handle_udp_packet(shared: Arc<SharedTransport>, data: Vec<u8>, src: Soc
                 match decrypt_link_envelope(sess, &shared.self_name, &env) {
                     Ok(pt) => pt,
                     Err(_) => {
-                        if env.sid.is_empty() || sess.sid == env.sid {
+                        // Drop session only if the matching active sid failed decryption;
+                        // ignore late packets carrying an older superseded sid.
+                        if env.sid == sess.sid {
                             sessions.remove(&peer);
                         }
                         return;
