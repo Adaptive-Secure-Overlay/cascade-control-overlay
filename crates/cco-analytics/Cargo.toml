@@ -9,3 +9,13 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
+cco-crypto.workspace = true
+num-bigint.workspace = true
+num-traits.workspace = true
+rand.workspace = true
+rayon.workspace = true
+rsa.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+thiserror.workspace = true

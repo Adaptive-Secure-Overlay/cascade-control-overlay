@@ -41,7 +41,7 @@ libc = "0.2"
 nix = { version = "0.29", features = ["socket", "net"] }
 num-bigint = "0.4"
 num-traits = "0.2"
-rand = "0.8"
+rand = { version = "0.8", features = ["small_rng"] }
 rand_core = { version = "0.6", features = ["getrandom"] }
 rayon = "1.10"
 rsa = { version = "0.9", features = ["sha2"] }
