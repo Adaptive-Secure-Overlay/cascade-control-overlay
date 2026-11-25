@@ -1,0 +1,11 @@
+[package]
+name = "cco-trust"
+description = "Authenticated rollback-resistant Trust Registry v2 with pinned Ed25519 root"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]

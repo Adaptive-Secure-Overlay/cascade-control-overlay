@@ -1,0 +1,11 @@
+[package]
+name = "cco-crypto"
+description = "Cryptographic primitives (X25519, Ed25519, HKDF-SHA256, AES-GCM) with zeroize for Cascade Control Overlay"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]

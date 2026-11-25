@@ -1,0 +1,11 @@
+[package]
+name = "cco-proto"
+description = "Wire protocol types, canonical JSON, LinkFrag UDP framing, and IKEv2/WireGuard parsers"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]

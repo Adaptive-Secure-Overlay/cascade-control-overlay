@@ -1,0 +1,11 @@
+[package]
+name = "cco-transport"
+description = "Async Tokio UDP peer mesh, 4-step MGMT handshake, and non-blocking session worker"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]

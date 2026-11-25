@@ -1,0 +1,15 @@
+[package]
+name = "cco-cli"
+description = "Unified CLI binary (cco) for Cascade Control Overlay"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[[bin]]
+name = "cco"
+path = "src/main.rs"
+
+[dependencies]
