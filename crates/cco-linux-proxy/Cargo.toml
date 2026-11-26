@@ -9,3 +9,14 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
+cco-cascade.workspace = true
+cco-proto.workspace = true
+cco-transport.workspace = true
+socket2.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+
+[target.'cfg(target_os = "linux")'.dependencies]
+libc.workspace = true
+nix.workspace = true

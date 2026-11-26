@@ -26,7 +26,11 @@ use cco_cascade::wireguard::{
     format_scenarios_csv, run_canonical_27_eve_results, run_canonical_27_scenarios,
 };
 use cco_crypto::Ed25519SecretKey;
-use cco_transport::{NodeTransportConfig, OverlayNode, PeerEndpoint, RelayOnlySink};
+use cco_linux_proxy::{
+    DEFAULT_CAPTURE_BASE_500, DEFAULT_CAPTURE_BASE_4500, DEFAULT_SOCKET_MARK, IkeProxyConfig,
+    LinuxIkeProxy, render_nftables_rules, render_xfrm_bypass_script,
+};
+use cco_transport::{IkeSink, NodeTransportConfig, OverlayNode, PeerEndpoint, RelayOnlySink};
 use cco_trust::{
     TrustRegistryStore, VerifyConstraints, build_trust_root_bytes, generate_node_identity,
     read_ed25519_key_file, read_x25519_key_file, sign_registry_files, verify_registry_bytes,
@@ -75,6 +79,30 @@ enum Commands {
         #[command(subcommand)]
         action: BenchCmd,
     },
+
+    /// Render parameterized Linux `nftables` or `ip xfrm` scripts from a peers JSON file.
+    RenderFirewall {
+        #[arg(long)]
+        name: String,
+        #[arg(long)]
+        peers: PathBuf,
+        #[arg(long, value_enum, default_value_t = FirewallKind::Nft)]
+        kind: FirewallKind,
+        #[arg(long, default_value_t = 9000)]
+        overlay_port: u16,
+        #[arg(long, default_value_t = DEFAULT_CAPTURE_BASE_500)]
+        capture_base_500: u16,
+        #[arg(long, default_value_t = DEFAULT_CAPTURE_BASE_4500)]
+        capture_base_4500: u16,
+        #[arg(long, default_value_t = DEFAULT_SOCKET_MARK)]
+        mark: u32,
+    },
+}
+
+#[derive(ValueEnum, Debug, Clone, Copy)]
+enum FirewallKind {
+    Nft,
+    Xfrm,
 }
 
 #[derive(Parser, Debug)]
@@ -147,6 +175,19 @@ struct NodeArgs {
     /// Disable proactive MGMT session preconnect at startup.
     #[arg(long)]
     no_preconnect: bool,
+
+    /// Enable the Linux transparent IKEv2 capture/inject proxy backend (requires Linux + CAP_NET_RAW).
+    #[arg(long)]
+    ike_proxy: bool,
+
+    #[arg(long, default_value_t = DEFAULT_CAPTURE_BASE_500)]
+    ike_capture_base_500: u16,
+
+    #[arg(long, default_value_t = DEFAULT_CAPTURE_BASE_4500)]
+    ike_capture_base_4500: u16,
+
+    #[arg(long, default_value_t = DEFAULT_SOCKET_MARK)]
+    ike_mark: u32,
 
     /// Allow non-POSIX private key files for local test fixtures (Windows).
     #[arg(long)]
@@ -338,6 +379,23 @@ async fn run(cli: Cli) -> Result<(), String> {
         Commands::WgSim { format } => run_wg_sim(format),
         Commands::Analytics { action } => run_analytics(action),
         Commands::Bench { action } => run_bench(action),
+        Commands::RenderFirewall {
+            name,
+            peers,
+            kind,
+            overlay_port,
+            capture_base_500,
+            capture_base_4500,
+            mark,
+        } => run_render_firewall(
+            &name,
+            &peers,
+            kind,
+            overlay_port,
+            capture_base_500,
+            capture_base_4500,
+            mark,
+        ),
     }
 }
 
@@ -404,6 +462,10 @@ async fn run_node(args: NodeArgs) -> Result<(), String> {
     };
     policy.validate().map_err(|e| e.code().to_owned())?;
 
+    let peer_ips: BTreeMap<String, std::net::Ipv4Addr> = peers
+        .iter()
+        .map(|(k, v)| (k.clone(), v.underlay_ip))
+        .collect();
     let mut cfg = NodeTransportConfig::new(&args.name, bind_addr, peers);
     cfg.fanout = MccFanout {
         x1: args.x1_fanout,
@@ -413,20 +475,70 @@ async fn run_node(args: NodeArgs) -> Result<(), String> {
     cfg.policy = policy;
     cfg.preconnect = !args.no_preconnect;
 
-    let handle = OverlayNode::start(cfg, security, Arc::new(RelayOnlySink))
+    let (sink, maybe_proxy): (Arc<dyn IkeSink>, Option<Arc<LinuxIkeProxy>>) = if args.ike_proxy {
+        let proxy_cfg = IkeProxyConfig::from_peers(
+            &args.name,
+            peer_ips,
+            args.ike_capture_base_500,
+            args.ike_capture_base_4500,
+            args.ike_mark,
+        )
+        .map_err(|e| e.to_string())?;
+        let proxy = Arc::new(LinuxIkeProxy::new(proxy_cfg));
+        let sink_arc: Arc<dyn IkeSink> = proxy.clone();
+        (sink_arc, Some(proxy))
+    } else {
+        (Arc::new(RelayOnlySink), None)
+    };
+
+    let handle = OverlayNode::start(cfg, security, sink)
         .await
         .map_err(|e| e.to_string())?;
+    if let Some(ref proxy) = maybe_proxy {
+        proxy
+            .start_capture(handle.clone())
+            .map_err(|e| e.to_string())?;
+    }
     println!(
         "{}",
         json!({
             "started": true,
             "node": handle.name(),
             "bind_addr": handle.local_addr().to_string(),
+            "ike_proxy": args.ike_proxy,
         })
     );
 
     let _ = tokio::signal::ctrl_c().await;
+    if let Some(ref proxy) = maybe_proxy {
+        proxy.stop();
+    }
     handle.shutdown().await;
+    Ok(())
+}
+
+fn run_render_firewall(
+    name: &str,
+    peers_path: &Path,
+    kind: FirewallKind,
+    overlay_port: u16,
+    base_500: u16,
+    base_4500: u16,
+    mark: u32,
+) -> Result<(), String> {
+    let raw = fs::read(peers_path).map_err(|_| "peers_file_unavailable".to_owned())?;
+    let peer_list: Vec<PeerEndpoint> =
+        serde_json::from_slice(&raw).map_err(|_| "invalid_peers_json".to_owned())?;
+    let peer_ips: BTreeMap<String, std::net::Ipv4Addr> = peer_list
+        .into_iter()
+        .map(|p| (p.name, p.underlay_ip))
+        .collect();
+    let cfg = IkeProxyConfig::from_peers(name, peer_ips, base_500, base_4500, mark)
+        .map_err(|e| e.to_string())?;
+    match kind {
+        FirewallKind::Nft => print!("{}", render_nftables_rules(&cfg)),
+        FirewallKind::Xfrm => print!("{}", render_xfrm_bypass_script(&cfg, overlay_port, 1)),
+    }
     Ok(())
 }
 
@@ -446,7 +558,7 @@ fn run_trust_admin(action: TrustAdminCmd) -> Result<(), String> {
             }
             let sk = Ed25519SecretKey::generate();
             let key_hex = sk.to_hex_zeroizing();
-            write_exclusive(&key_out, format!("{}\n", &*key_hex).as_bytes(), true)?;
+            write_exclusive(&key_out, format!("{}\n", *key_hex).as_bytes(), true)?;
             let mut signers = BTreeMap::new();
             signers.insert(issuer_id.clone(), sk.public_key());
             let mut root_bytes =
