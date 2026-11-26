@@ -300,6 +300,9 @@ struct WgTunnelArgs {
     ike_fanout: usize,
     #[arg(long, default_value_t = 12_000)]
     deadline_ms: u64,
+    /// Disable proactive MGMT session preconnect at startup.
+    #[arg(long)]
+    no_preconnect: bool,
     /// Proactively initiate WireGuard Type 1 handshake through the MCC overlay on startup.
     #[arg(long)]
     initiate: bool,
@@ -971,6 +974,7 @@ async fn run_wg_tunnel(args: WgTunnelArgs) -> Result<(), String> {
         ike: args.ike_fanout,
     };
     overlay.policy = policy;
+    overlay.preconnect = !args.no_preconnect;
 
     let tun_fd = cco_linux_proxy::open_linux_tun(&args.tun_name).map_err(|e| e.to_string())?;
     let tun = UnixFdTun::from_owned_fd(tun_fd, false).map_err(|_| "tun_init_failed".to_owned())?;

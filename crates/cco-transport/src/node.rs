@@ -409,7 +409,10 @@ impl OverlayNode {
         let preconnect_peers: Vec<String> = config
             .peers
             .keys()
-            .filter(|p| p.as_str() > self_name.as_str())
+            .filter(|p| {
+                p.as_str() > self_name.as_str()
+                    && !config.preconnect_exclude.iter().any(|ex| ex == *p)
+            })
             .cloned()
             .collect();
 

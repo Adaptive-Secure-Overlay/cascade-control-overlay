@@ -230,7 +230,7 @@ pub struct SplitWireGuardTunnel;
 impl SplitWireGuardTunnel {
     /// Starts a live split tunnel after verifying `security` (fail-closed Trust Registry v2 gate).
     pub async fn start(
-        config: WgTunnelConfig,
+        mut config: WgTunnelConfig,
         security: EndpointSecurity,
         tun: Arc<dyn TunDevice>,
     ) -> Result<SplitTunnelHandle, WgTunnelError> {
@@ -239,6 +239,20 @@ impl SplitWireGuardTunnel {
             || config.peer_name == config.overlay.name
         {
             return Err(WgTunnelError::InvalidPeer);
+        }
+
+        // Security privacy invariant (`ov_ab == 0`): never initiate proactive direct MGMT
+        // overlay sessions to the target VPN peer; all control-plane handshakes must traverse relays.
+        if !config
+            .overlay
+            .preconnect_exclude
+            .iter()
+            .any(|p| p == &config.peer_name)
+        {
+            config
+                .overlay
+                .preconnect_exclude
+                .push(config.peer_name.clone());
         }
 
         let static_secret = WgStaticSecret::from(*config.wg_private_key);

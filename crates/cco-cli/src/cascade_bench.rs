@@ -412,7 +412,7 @@ async fn bench_ipsec_point(
     }
 
     // Ensure proactive MGMT mesh is warmed up so we measure pure cascade handshake latency.
-    wait_mesh_warm(&pool.names, &handles, Duration::from_secs(4)).await;
+    wait_mesh_warm(&pool.names, &handles, false, Duration::from_secs(4)).await;
 
     let mut latencies_ms = Vec::with_capacity(trials);
     let mut pkt_deltas = Vec::with_capacity(trials);
@@ -587,7 +587,7 @@ async fn bench_wireguard_point(
 
         mesh_map.insert("A".to_owned(), handle_a.overlay_handle().clone());
         mesh_map.insert("B".to_owned(), handle_b.overlay_handle().clone());
-        wait_mesh_warm(&pool.names, &mesh_map, Duration::from_secs(4)).await;
+        wait_mesh_warm(&pool.names, &mesh_map, true, Duration::from_secs(4)).await;
 
         let all_handles = || {
             relays
@@ -720,6 +720,7 @@ fn build_point(
 async fn wait_mesh_warm(
     names: &[String],
     handles: &BTreeMap<String, OverlayNodeHandle>,
+    skip_direct_ab: bool,
     timeout: Duration,
 ) {
     let deadline = tokio::time::Instant::now() + timeout;
@@ -728,6 +729,9 @@ async fn wait_mesh_warm(
         'outer: for a in names {
             if let Some(ha) = handles.get(a) {
                 for b in names {
+                    if skip_direct_ab && ((a == "A" && b == "B") || (a == "B" && b == "A")) {
+                        continue;
+                    }
                     if a < b && !ha.has_session(b).await {
                         all_ready = false;
                         break 'outer;

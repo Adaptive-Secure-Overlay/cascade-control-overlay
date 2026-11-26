@@ -213,6 +213,10 @@ async fn four_node_split_wireguard_handshake_via_mcc_and_direct_type4_data() {
     // Give proactive MGMT preconnect a brief moment
     tokio::time::sleep(Duration::from_millis(200)).await;
 
+    // Even with preconnect=true, SplitWireGuardTunnel excludes direct peer from startup preconnect (`ov_ab == 0`).
+    assert!(!handle_a.overlay_handle().has_session("B").await);
+    assert!(!handle_b.overlay_handle().has_session("A").await);
+
     // 1. Send an IPv4 packet from A to B — triggers WG type 1 via MCC overlay,
     //    WG type 2 back via PRIV_BACK, and then delivers the queued IPv4 packet over DIRECT type 4!
     let pkt_a_to_b = build_ipv4_udp(
@@ -284,6 +288,259 @@ async fn four_node_split_wireguard_handshake_via_mcc_and_direct_type4_data() {
     handle_a.shutdown().await;
     handle_b.shutdown().await;
     for r in relay_handles {
+        r.shutdown().await;
+    }
+}
+
+#[tokio::test]
+async fn wg_tunnel_excludes_direct_peer_from_preconnect_and_supports_no_preconnect() {
+    let dir = TempDir::new().unwrap();
+    let names = ["A", "X1", "X2", "B"];
+
+    let root_sk = Ed25519SecretKey::generate();
+    let mut signers = BTreeMap::new();
+    signers.insert("wg-pre-root".to_owned(), root_sk.public_key());
+    let root_path = dir.path().join("root.json");
+    fs::write(&root_path, build_trust_root_bytes(&signers).unwrap()).unwrap();
+
+    let ports = pick_free_udp_ports(6);
+    let mut signing = BTreeMap::new();
+    let mut encryption = BTreeMap::new();
+    let mut records = BTreeMap::new();
+    let mut peers = BTreeMap::new();
+
+    for (i, &name) in names.iter().enumerate() {
+        let esk = Ed25519SecretKey::generate();
+        let xsk = X25519SecretKey::generate();
+        records.insert(
+            name.to_owned(),
+            NodeKeyRecord {
+                encryption: xsk.public_key(),
+                verification: esk.public_key(),
+                key_id: esk.public_key().key_id(),
+                revoked: false,
+            },
+        );
+        signing.insert(name.to_owned(), esk);
+        encryption.insert(name.to_owned(), xsk);
+        peers.insert(
+            name.to_owned(),
+            PeerEndpoint {
+                name: name.to_owned(),
+                overlay_addr: SocketAddr::from(([127, 0, 0, 1], ports[i])),
+                underlay_ip: Ipv4Addr::new(192, 0, 2, (20 + i) as u8),
+            },
+        );
+    }
+
+    let reg_bytes = sign_registry_v2(1, &records, "wg-pre-root", &root_sk).unwrap();
+    let verified = verify_registry_bytes(
+        &reg_bytes,
+        &root_path,
+        names.iter().copied(),
+        VerifyConstraints::default(),
+    )
+    .unwrap();
+    let reg_sha256 = verified.status().sha256;
+    let now_s = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_secs() as i64;
+
+    let make_sec = |name: &str, tag: &str| {
+        EndpointSecurity::new(
+            name,
+            verified.clone(),
+            Ed25519SecretKey::from_bytes(*signing[name].to_bytes_zeroizing()),
+            X25519SecretKey::from_bytes(*encryption[name].to_bytes_zeroizing()),
+            dir.path().join(format!("{name}_{tag}.sqlite")),
+            now_s,
+        )
+        .unwrap()
+    };
+
+    // Part 1: preconnect=true -> relays warm up, but direct A <-> B MGMT session MUST stay absent!
+    let mut relays = Vec::new();
+    for &relay in &["X1", "X2"] {
+        let mut cfg = NodeTransportConfig::new(relay, peers[relay].overlay_addr, peers.clone());
+        cfg.preconnect = false;
+        relays.push(
+            OverlayNode::start(cfg, make_sec(relay, "p1"), Arc::new(RelayOnlySink))
+                .await
+                .unwrap(),
+        );
+    }
+
+    let wg_sk_a = X25519SecretKey::generate();
+    let wg_pk_a = *wg_sk_a.public_key().as_bytes();
+    let wg_sk_b = X25519SecretKey::generate();
+    let wg_pk_b = *wg_sk_b.public_key().as_bytes();
+    let direct_a = SocketAddr::from(([127, 0, 0, 1], ports[4]));
+    let direct_b = SocketAddr::from(([127, 0, 0, 1], ports[5]));
+
+    let (tun_a1, _app_a1) = ChannelTun::pair(16);
+    let (tun_b1, _app_b1) = ChannelTun::pair(16);
+    let mut ov_b1 = NodeTransportConfig::new("B", peers["B"].overlay_addr, peers.clone());
+    ov_b1.preconnect = true;
+    let hb1 = SplitWireGuardTunnel::start(
+        WgTunnelConfig {
+            peer_name: "A".to_owned(),
+            wg_private_key: Zeroizing::new(*wg_sk_b.to_bytes_zeroizing()),
+            peer_wg_public_key: wg_pk_a,
+            wg_preshared_key: None,
+            direct_bind_addr: direct_b,
+            peer_direct_addr: direct_a,
+            persistent_keepalive_secs: None,
+            overlay: ov_b1,
+            trust_registry_version: 1,
+            trust_registry_sha256: reg_sha256.clone(),
+        },
+        make_sec("B", "p1"),
+        tun_b1,
+    )
+    .await
+    .unwrap();
+
+    let mut ov_a1 = NodeTransportConfig::new("A", peers["A"].overlay_addr, peers.clone());
+    ov_a1.preconnect = true;
+    let ha1 = SplitWireGuardTunnel::start(
+        WgTunnelConfig {
+            peer_name: "B".to_owned(),
+            wg_private_key: Zeroizing::new(*wg_sk_a.to_bytes_zeroizing()),
+            peer_wg_public_key: wg_pk_b,
+            wg_preshared_key: None,
+            direct_bind_addr: direct_a,
+            peer_direct_addr: direct_b,
+            persistent_keepalive_secs: None,
+            overlay: ov_a1,
+            trust_registry_version: 1,
+            trust_registry_sha256: reg_sha256.clone(),
+        },
+        make_sec("A", "p1"),
+        tun_a1,
+    )
+    .await
+    .unwrap();
+
+    tokio::time::sleep(Duration::from_millis(250)).await;
+    // A proactively preconnected to X1 and X2 (since "X1" > "A"), NEVER directly to B!
+    assert!(ha1.overlay_handle().has_session("X1").await);
+    assert!(ha1.overlay_handle().has_session("X2").await);
+    assert!(
+        !ha1.overlay_handle().has_session("B").await,
+        "wg-tunnel must never preconnect directly from A to target peer B"
+    );
+    assert!(
+        !hb1.overlay_handle().has_session("A").await,
+        "wg-tunnel must never preconnect directly from B to target peer A"
+    );
+
+    ha1.shutdown().await;
+    hb1.shutdown().await;
+    for r in relays {
+        r.shutdown().await;
+    }
+    tokio::time::sleep(Duration::from_millis(80)).await;
+
+    // Part 2: `--no-preconnect` (preconnect=false) in cascade mode -> zero MGMT traffic at startup,
+    // full lazy WireGuard handshake still succeeds, and direct A <-> B overlay session stays strictly absent!
+    let ports2 = pick_free_udp_ports(6);
+    let mut peers2 = BTreeMap::new();
+    for (i, &name) in names.iter().enumerate() {
+        peers2.insert(
+            name.to_owned(),
+            PeerEndpoint {
+                name: name.to_owned(),
+                overlay_addr: SocketAddr::from(([127, 0, 0, 1], ports2[i])),
+                underlay_ip: Ipv4Addr::new(192, 0, 2, (30 + i) as u8),
+            },
+        );
+    }
+    let direct_a2 = SocketAddr::from(([127, 0, 0, 1], ports2[4]));
+    let direct_b2 = SocketAddr::from(([127, 0, 0, 1], ports2[5]));
+
+    let mut relays2 = Vec::new();
+    for &relay in &["X1", "X2"] {
+        let mut cfg = NodeTransportConfig::new(relay, peers2[relay].overlay_addr, peers2.clone());
+        cfg.route_mode = cco_transport::RouteMode::Cascade;
+        cfg.preconnect = false;
+        relays2.push(
+            OverlayNode::start(cfg, make_sec(relay, "p2"), Arc::new(RelayOnlySink))
+                .await
+                .unwrap(),
+        );
+    }
+
+    let (tun_a2, app_a2) = ChannelTun::pair(32);
+    let (tun_b2, app_b2) = ChannelTun::pair(32);
+    let mut ov_b2 = NodeTransportConfig::new("B", peers2["B"].overlay_addr, peers2.clone());
+    ov_b2.route_mode = cco_transport::RouteMode::Cascade;
+    ov_b2.preconnect = false;
+    let hb2 = SplitWireGuardTunnel::start(
+        WgTunnelConfig {
+            peer_name: "A".to_owned(),
+            wg_private_key: Zeroizing::new(*wg_sk_b.to_bytes_zeroizing()),
+            peer_wg_public_key: wg_pk_a,
+            wg_preshared_key: None,
+            direct_bind_addr: direct_b2,
+            peer_direct_addr: direct_a2,
+            persistent_keepalive_secs: None,
+            overlay: ov_b2,
+            trust_registry_version: 1,
+            trust_registry_sha256: reg_sha256.clone(),
+        },
+        make_sec("B", "p2"),
+        tun_b2,
+    )
+    .await
+    .unwrap();
+
+    let mut ov_a2 = NodeTransportConfig::new("A", peers2["A"].overlay_addr, peers2.clone());
+    ov_a2.route_mode = cco_transport::RouteMode::Cascade;
+    ov_a2.preconnect = false;
+    let ha2 = SplitWireGuardTunnel::start(
+        WgTunnelConfig {
+            peer_name: "B".to_owned(),
+            wg_private_key: Zeroizing::new(*wg_sk_a.to_bytes_zeroizing()),
+            peer_wg_public_key: wg_pk_b,
+            wg_preshared_key: None,
+            direct_bind_addr: direct_a2,
+            peer_direct_addr: direct_b2,
+            persistent_keepalive_secs: None,
+            overlay: ov_a2,
+            trust_registry_version: 1,
+            trust_registry_sha256: reg_sha256,
+        },
+        make_sec("A", "p2"),
+        tun_a2,
+    )
+    .await
+    .unwrap();
+
+    tokio::time::sleep(Duration::from_millis(150)).await;
+    assert_eq!(ha2.overlay_handle().counters().udp_packets_tx, 0);
+    assert_eq!(hb2.overlay_handle().counters().udp_packets_tx, 0);
+
+    let pkt = build_ipv4_udp(
+        Ipv4Addr::new(198, 51, 100, 10),
+        Ipv4Addr::new(198, 51, 100, 13),
+        41000,
+        41001,
+        b"no-preconnect-wg-payload",
+    );
+    app_a2.send_outbound_ip(pkt.clone()).await.unwrap();
+    let got = tokio::time::timeout(Duration::from_secs(6), app_b2.recv_inbound_ip())
+        .await
+        .expect("timed out waiting for lazy no-preconnect WG packet")
+        .expect("TUN B closed");
+    assert_eq!(got, pkt);
+    assert_eq!(ha2.stats().direct_handshake_tx, 0);
+    assert!(!ha2.overlay_handle().has_session("B").await);
+    assert!(!hb2.overlay_handle().has_session("A").await);
+
+    ha2.shutdown().await;
+    hb2.shutdown().await;
+    for r in relays2 {
         r.shutdown().await;
     }
 }

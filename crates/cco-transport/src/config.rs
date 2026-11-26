@@ -101,6 +101,9 @@ pub struct NodeTransportConfig {
     pub retries: usize,
     /// Whether to proactively establish hop MGMT sessions to peers at startup.
     pub preconnect: bool,
+    /// Peer names excluded from proactive startup MGMT preconnect (e.g., direct VPN peer
+    /// in `wg-tunnel` so `A` and `B` never exchange direct overlay MGMT frames: `ov_ab == 0`).
+    pub preconnect_exclude: Vec<String>,
     /// Optional deterministic seed for reproducible E2E tests.
     pub deterministic_seed: Option<u64>,
     /// Optional socket protector callback (e.g., Android `VpnService.protect`).
@@ -120,6 +123,7 @@ impl fmt::Debug for NodeTransportConfig {
             .field("udp_timeout_ms", &self.udp_timeout_ms)
             .field("retries", &self.retries)
             .field("preconnect", &self.preconnect)
+            .field("preconnect_exclude", &self.preconnect_exclude)
             .field("has_socket_protector", &self.socket_protector.is_some())
             .finish()
     }
@@ -144,6 +148,7 @@ impl NodeTransportConfig {
             udp_timeout_ms: 1200,
             retries: 4,
             preconnect: true,
+            preconnect_exclude: Vec::new(),
             deterministic_seed: None,
             socket_protector: None,
         }
