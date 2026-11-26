@@ -28,5 +28,5 @@ See [docs/THREAT-MODEL.md](docs/THREAT-MODEL.md) for the complete adversary mode
 If you discover a cryptographic, parsing, protocol, or memory-safety issue:
 
 1. **Do not** open a public issue with exploit details.
-2. Report privately via GitHub Security Advisories on `ZuyVladislav/cascade-control-overlay` or contact the maintainer directly.
+2. Report privately via GitHub Security Advisories on `Adaptive-Secure-Overlay/cascade-control-overlay` or contact the maintainer directly.
 3. Include a minimal reproduction test case, affected crate/version, and impact summary.

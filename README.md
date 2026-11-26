@@ -1,6 +1,7 @@
 # Cascade Control Overlay (`cco`)
 
-[![CI](https://github.com/ZuyVladislav/cascade-control-overlay/actions/workflows/ci.yml/badge.svg)](https://github.com/ZuyVladislav/cascade-control-overlay/actions/workflows/ci.yml)
+[![CI](https://github.com/Adaptive-Secure-Overlay/cascade-control-overlay/actions/workflows/ci.yml/badge.svg)](https://github.com/Adaptive-Secure-Overlay/cascade-control-overlay/actions/workflows/ci.yml)
+[![Org: Adaptive-Secure-Overlay](https://img.shields.io/badge/org-Adaptive--Secure--Overlay-166534.svg)](https://github.com/Adaptive-Secure-Overlay)
 [![License: MIT OR Apache-2.0](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue.svg)](#license)
 [![Rust MSRV 1.85+](https://img.shields.io/badge/MSRV-1.85%2B-orange.svg)](#quick-start)
 
@@ -102,10 +103,18 @@ See [SECURITY.md](SECURITY.md) and [docs/THREAT-MODEL.md](docs/THREAT-MODEL.md) 
 - [docs/BENCHMARKS.md](docs/BENCHMARKS.md) — Python vs Rust measurements, Table 4.6 crypto comparison, and Monte Carlo verification
 - [docs/REPRODUCING-LAB.md](docs/REPRODUCING-LAB.md) — Step-by-step L1/L2/L3/L4 reproduction guide
 
+## Related Repositories (`Adaptive-Secure-Overlay`)
+
+This crate workspace is the standalone Rust core and verification suite within the [Adaptive Secure Overlay](https://github.com/Adaptive-Secure-Overlay) research organization, complementing the sibling Python prototypes and datasets:
+
+- [Adaptive-Secure-Overlay/adaptive-ipsec-overlay](https://github.com/Adaptive-Secure-Overlay/adaptive-ipsec-overlay) — original Python IPsec/IKEv2 control-plane core (`universal_cascade`, Trust Registry, strongSwan/nftables) and platform integrations
+- [Adaptive-Secure-Overlay/adaptive-wireguard-overlay](https://github.com/Adaptive-Secure-Overlay/adaptive-wireguard-overlay) — Python WireGuard handshake overlay (`v0.2.0`), Ed25519 trust registry, and MCC E2E authentication/privacy tracks
+- [Adaptive-Secure-Overlay/adaptive-overlay-experiments](https://github.com/Adaptive-Secure-Overlay/adaptive-overlay-experiments) — reproducible EVE-NG test harnesses, cascade/threshold datasets, and empirical benchmarks
+
 ## Academic Context
 
-Developed by **Vladislav Zyuzin** as the open-source Rust reference implementation of the algorithms and analytical methodology from the Candidate of Technical Sciences dissertation (specialty 2.3.6 "Information Security Methods and Systems").
-Registered software certificates (Rospatent): *to be populated by the author with exact registration numbers*.
+Developed by **Vladislav Zyuzin** as part of a Candidate of Technical Sciences dissertation in specialty **2.3.6 "Information Security Methods and Systems"**.
+This Rust version is an independent open-source port and evolution of the algorithms from the original Python prototypes previously registered with Rospatent (certificates of state registration of computer programs No. 2024610455 dated 10.01.2024 and No. 2025613326 dated 11.02.2025).
 
 ## License
 

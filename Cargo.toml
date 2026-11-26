@@ -17,7 +17,7 @@ edition = "2024"
 rust-version = "1.85"
 authors = ["Vladislav Zyuzin <vlados9597@mail.ru>"]
 license = "MIT OR Apache-2.0"
-repository = "https://github.com/ZuyVladislav/cascade-control-overlay"
+repository = "https://github.com/Adaptive-Secure-Overlay/cascade-control-overlay"
 keywords = ["vpn", "ikev2", "wireguard", "overlay", "cryptography"]
 categories = ["network-programming", "cryptography"]
 
