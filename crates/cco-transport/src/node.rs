@@ -12,6 +12,7 @@ use cco_cascade::mcc::{
     EndpointSecurity, IkeInjectionOutcome, LocalDeliveryProof, MccAction, MccNodeConfig,
     MccNodeMachine,
 };
+use cco_crypto::Key256;
 use cco_proto::{
     ErrorEnvelope, LinkFragFrame, LinkFragReassembler, MessageType, MgmtAuth, MgmtInit,
     MgmtInitResp, SecureEnvelope, T_ERROR, T_LINK_FRAG, T_MGMT_AUTH, T_MGMT_AUTH_RESP, T_MGMT_INIT,
@@ -29,9 +30,50 @@ use crate::mgmt::{
     encrypt_link_envelope, responder_handle_auth, responder_handle_init,
 };
 
-const MAX_PENDING_PER_PEER: usize = 64;
+const MAX_PENDING_PER_PEER: usize = 512;
 
 type PendingSendMap = HashMap<String, VecDeque<(MessageType, Vec<u8>)>>;
+type PendingInitAuth = (InitiatorHandshake, Key256, oneshot::Sender<bool>);
+
+/// Per-peer MGMT session slot retaining one previous session during rekey / crossing-init overlap.
+struct PeerSessionSlot {
+    active: MgmtSession,
+    previous: Option<MgmtSession>,
+}
+
+impl PeerSessionSlot {
+    fn new(session: MgmtSession) -> Self {
+        Self {
+            active: session,
+            previous: None,
+        }
+    }
+
+    fn install(&mut self, session: MgmtSession) {
+        if self.active.sid == session.sid {
+            self.active = session;
+            return;
+        }
+        let prev = std::mem::replace(&mut self.active, session);
+        self.previous = Some(prev);
+    }
+
+    fn decrypt(
+        &self,
+        self_name: &str,
+        env: &SecureEnvelope,
+    ) -> Result<Vec<u8>, (TransportError, bool)> {
+        if env.sid.is_empty() || env.sid == self.active.sid {
+            return decrypt_link_envelope(&self.active, self_name, env).map_err(|e| (e, true));
+        }
+        if let Some(ref prev) = self.previous {
+            if env.sid == prev.sid {
+                return decrypt_link_envelope(prev, self_name, env).map_err(|e| (e, false));
+            }
+        }
+        Err((TransportError::Protocol("stale_session_id"), false))
+    }
+}
 
 /// Local IKE injection boundary invoked when `MccNodeMachine` emits a single-use [`LocalDeliveryProof`].
 pub trait IkeSink: Send + Sync + 'static {
@@ -62,10 +104,10 @@ struct SharedTransport {
     socket: UdpSocket,
     addr_to_peer: HashMap<SocketAddr, String>,
 
-    sessions: Mutex<HashMap<String, MgmtSession>>,
+    sessions: Mutex<HashMap<String, PeerSessionSlot>>,
     pending_resp: Mutex<HashMap<String, PendingResponderHandshake>>,
     hs_init_waiters: Mutex<HashMap<String, oneshot::Sender<MgmtInitResp>>>,
-    hs_auth_waiters: Mutex<HashMap<String, oneshot::Sender<MgmtAuth>>>,
+    pending_init_auth: Mutex<HashMap<String, PendingInitAuth>>,
     inflight_ensure: Mutex<HashMap<String, Arc<Notify>>>,
     pending_sends: Mutex<PendingSendMap>,
     reassembler: Mutex<LinkFragReassembler>,
@@ -219,7 +261,7 @@ impl OverlayNode {
             .map_err(|e| TransportError::Cascade(e.code()))?;
 
         // Bind UDP socket ONLY after Trust Registry v2 + EndpointSecurity + MccNodeMachine succeeded!
-        let socket = UdpSocket::bind(config.bind_addr).await?;
+        let socket = bind_sized_udp_socket(config.bind_addr)?;
         let local_addr = socket.local_addr()?;
 
         let mut addr_to_peer = HashMap::new();
@@ -246,7 +288,7 @@ impl OverlayNode {
             sessions: Mutex::new(HashMap::new()),
             pending_resp: Mutex::new(HashMap::new()),
             hs_init_waiters: Mutex::new(HashMap::new()),
-            hs_auth_waiters: Mutex::new(HashMap::new()),
+            pending_init_auth: Mutex::new(HashMap::new()),
             inflight_ensure: Mutex::new(HashMap::new()),
             pending_sends: Mutex::new(HashMap::new()),
             reassembler: Mutex::new(LinkFragReassembler::new(self_name)),
@@ -345,6 +387,22 @@ impl OverlayNode {
     }
 }
 
+fn bind_sized_udp_socket(addr: SocketAddr) -> Result<UdpSocket, TransportError> {
+    let domain = match addr {
+        SocketAddr::V4(_) => socket2::Domain::IPV4,
+        SocketAddr::V6(_) => socket2::Domain::IPV6,
+    };
+    let sock = socket2::Socket::new(domain, socket2::Type::DGRAM, Some(socket2::Protocol::UDP))?;
+    // Size kernel UDP buffers to absorb multi-route LINK_FRAG bursts (e.g., 10-node MCC fanout)
+    // without OS-level silent packet drops (Windows defaults to 64 KiB).
+    let _ = sock.set_recv_buffer_size(4 * 1024 * 1024);
+    let _ = sock.set_send_buffer_size(4 * 1024 * 1024);
+    sock.set_nonblocking(true)?;
+    sock.bind(&addr.into())?;
+    let std_sock: std::net::UdpSocket = sock.into();
+    Ok(UdpSocket::from_std(std_sock)?)
+}
+
 fn now_ms() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -373,6 +431,19 @@ async fn send_peer_framed(
     Ok(())
 }
 
+async fn install_peer_session(shared: &SharedTransport, peer: &str, session: MgmtSession) {
+    let mut sessions = shared.sessions.lock().await;
+    if let Some(slot) = sessions.get_mut(peer) {
+        slot.install(session);
+    } else {
+        sessions.insert(peer.to_owned(), PeerSessionSlot::new(session));
+    }
+    drop(sessions);
+    if let Some(notify) = shared.inflight_ensure.lock().await.get(peer).cloned() {
+        notify.notify_waiters();
+    }
+}
+
 /// Non-blocking 4-step MGMT handshake with deduplication across concurrent callers.
 async fn ensure_session_async(
     shared: Arc<SharedTransport>,
@@ -382,6 +453,7 @@ async fn ensure_session_async(
         return Err(TransportError::UnknownPeer);
     }
     if shared.sessions.lock().await.contains_key(peer) {
+        flush_pending_sends(Arc::clone(&shared), peer).await;
         return Ok(());
     }
 
@@ -403,8 +475,11 @@ async fn ensure_session_async(
                 .udp_timeout_ms
                 .saturating_mul(shared.config.retries.max(1) as u64),
         );
-        let _ = tokio::time::timeout(wait_limit, notify.notified()).await;
+        if !shared.sessions.lock().await.contains_key(peer) {
+            let _ = tokio::time::timeout(wait_limit, notify.notified()).await;
+        }
         return if shared.sessions.lock().await.contains_key(peer) {
+            flush_pending_sends(Arc::clone(&shared), peer).await;
             Ok(())
         } else {
             Err(TransportError::MgmtHandshakeFailed)
@@ -425,19 +500,11 @@ async fn ensure_session_async(
         };
         let sid = hs.sid.clone();
         let (init_tx, init_rx) = oneshot::channel();
-        let (auth_tx, auth_rx) = oneshot::channel();
-        {
-            shared
-                .hs_init_waiters
-                .lock()
-                .await
-                .insert(sid.clone(), init_tx);
-            shared
-                .hs_auth_waiters
-                .lock()
-                .await
-                .insert(sid.clone(), auth_tx);
-        }
+        shared
+            .hs_init_waiters
+            .lock()
+            .await
+            .insert(sid.clone(), init_tx);
 
         if send_peer_framed(&shared, peer, &init_wire).await.is_err() {
             cleanup_hs_waiters(&shared, &sid).await;
@@ -453,27 +520,32 @@ async fn ensure_session_async(
             cleanup_hs_waiters(&shared, &sid).await;
             continue;
         };
+
+        // Register initiator state BEFORE sending MGMT_AUTH so handle_udp_packet
+        // finalizes and installs the session synchronously upon MGMT_AUTH_RESP
+        // (strictly before reading the next UDP datagram from the socket).
+        let (auth_done_tx, auth_done_rx) = oneshot::channel();
+        shared
+            .pending_init_auth
+            .lock()
+            .await
+            .insert(sid.clone(), (hs, kd, auth_done_tx));
+
         if send_peer_framed(&shared, peer, &auth_wire).await.is_err() {
             cleanup_hs_waiters(&shared, &sid).await;
             continue;
         }
 
-        let Ok(Ok(auth_resp)) = tokio::time::timeout(timeout, auth_rx).await else {
-            cleanup_hs_waiters(&shared, &sid).await;
-            continue;
-        };
-
-        if let Ok(session) = hs.finish_auth_resp(&shared.self_name, kd, &auth_resp) {
-            shared
-                .sessions
-                .lock()
-                .await
-                .insert(peer.to_owned(), session);
-            cleanup_hs_waiters(&shared, &sid).await;
-            established = true;
-            break;
+        match tokio::time::timeout(timeout, auth_done_rx).await {
+            Ok(Ok(true)) => {
+                cleanup_hs_waiters(&shared, &sid).await;
+                established = true;
+                break;
+            }
+            _ => {
+                cleanup_hs_waiters(&shared, &sid).await;
+            }
         }
-        cleanup_hs_waiters(&shared, &sid).await;
     }
 
     // Wake any tasks waiting on this session and flush queued messages!
@@ -481,7 +553,7 @@ async fn ensure_session_async(
         notify.notify_waiters();
     }
 
-    if established {
+    if established || shared.sessions.lock().await.contains_key(peer) {
         flush_pending_sends(Arc::clone(&shared), peer).await;
         Ok(())
     } else {
@@ -492,24 +564,29 @@ async fn ensure_session_async(
 
 async fn cleanup_hs_waiters(shared: &SharedTransport, sid: &str) {
     shared.hs_init_waiters.lock().await.remove(sid);
-    shared.hs_auth_waiters.lock().await.remove(sid);
+    shared.pending_init_auth.lock().await.remove(sid);
 }
 
 async fn flush_pending_sends(shared: Arc<SharedTransport>, peer: &str) {
-    let queued = { shared.pending_sends.lock().await.remove(peer) };
-    let Some(items) = queued else {
-        return;
-    };
-    for (mtype, payload) in items {
-        let maybe_wire = {
-            let sessions = shared.sessions.lock().await;
-            sessions
-                .get(peer)
-                .map(|sess| encrypt_link_envelope(sess, &shared.self_name, mtype, &payload, None))
+    loop {
+        let queued = { shared.pending_sends.lock().await.remove(peer) };
+        let Some(items) = queued else {
+            return;
         };
-        if let Some(Ok(wire)) = maybe_wire {
-            if let Err(err) = send_peer_framed(&shared, peer, &wire).await {
-                warn!(peer, error = %err, "queued send after session establishment failed");
+        if items.is_empty() {
+            return;
+        }
+        for (mtype, payload) in items {
+            let maybe_wire = {
+                let sessions = shared.sessions.lock().await;
+                sessions.get(peer).map(|slot| {
+                    encrypt_link_envelope(&slot.active, &shared.self_name, mtype, &payload, None)
+                })
+            };
+            if let Some(Ok(wire)) = maybe_wire {
+                if let Err(err) = send_peer_framed(&shared, peer, &wire).await {
+                    warn!(peer, error = %err, "queued send after session establishment failed");
+                }
             }
         }
     }
@@ -521,11 +598,26 @@ async fn send_link_encrypted(
     mtype: MessageType,
     payload: Vec<u8>,
 ) -> Result<(), TransportError> {
+    // Hold lock order (sessions -> pending_sends) atomically so a message can never be
+    // enqueued right after a racing session install already drained pending_sends.
     let maybe_wire = {
         let sessions = shared.sessions.lock().await;
-        sessions
-            .get(peer)
-            .map(|sess| encrypt_link_envelope(sess, &shared.self_name, mtype, &payload, None))
+        if let Some(slot) = sessions.get(peer) {
+            Some(encrypt_link_envelope(
+                &slot.active,
+                &shared.self_name,
+                mtype,
+                &payload,
+                None,
+            ))
+        } else {
+            let mut pending = shared.pending_sends.lock().await;
+            let queue = pending.entry(peer.to_owned()).or_default();
+            if queue.len() < MAX_PENDING_PER_PEER {
+                queue.push_back((mtype, payload));
+            }
+            None
+        }
     };
 
     if let Some(wire_res) = maybe_wire {
@@ -533,14 +625,6 @@ async fn send_link_encrypted(
         return send_peer_framed(&shared, peer, &wire).await;
     }
 
-    // Non-blocking session establishment (fixes NO_SESSION_NEXT without blocking recv loop!)
-    {
-        let mut pending = shared.pending_sends.lock().await;
-        let queue = pending.entry(peer.to_owned()).or_default();
-        if queue.len() < MAX_PENDING_PER_PEER {
-            queue.push_back((mtype, payload));
-        }
-    }
     let s = Arc::clone(&shared);
     let peer_owned = peer.to_owned();
     tokio::spawn(async move {
@@ -646,7 +730,7 @@ async fn handle_udp_packet(shared: Arc<SharedTransport>, data: Vec<u8>, src: Soc
                 if let Some(pending) = maybe_pending {
                     match responder_handle_auth(&shared.self_name, &peer, pending, &auth) {
                         Ok((session, resp_wire)) => {
-                            shared.sessions.lock().await.insert(peer.clone(), session);
+                            install_peer_session(&shared, &peer, session).await;
                             let _ = send_peer_framed(&shared, &peer, &resp_wire).await;
                             flush_pending_sends(Arc::clone(&shared), &peer).await;
                         }
@@ -663,8 +747,18 @@ async fn handle_udp_packet(shared: Arc<SharedTransport>, data: Vec<u8>, src: Soc
         }
         T_MGMT_AUTH_RESP => {
             if let Ok(resp2) = serde_json::from_value::<MgmtAuth>(val) {
-                if let Some(tx) = shared.hs_auth_waiters.lock().await.remove(&resp2.sid) {
-                    let _ = tx.send(resp2);
+                let maybe_pending = shared.pending_init_auth.lock().await.remove(&resp2.sid);
+                if let Some((hs, kd, done_tx)) = maybe_pending {
+                    match hs.finish_auth_resp(&shared.self_name, kd, &resp2) {
+                        Ok(session) => {
+                            install_peer_session(&shared, &peer, session).await;
+                            let _ = done_tx.send(true);
+                            flush_pending_sends(Arc::clone(&shared), &peer).await;
+                        }
+                        Err(_) => {
+                            let _ = done_tx.send(false);
+                        }
+                    }
                 }
             }
         }
@@ -684,15 +778,13 @@ async fn handle_udp_packet(shared: Arc<SharedTransport>, data: Vec<u8>, src: Soc
             };
             let plain = {
                 let mut sessions = shared.sessions.lock().await;
-                let Some(sess) = sessions.get(&peer) else {
+                let Some(slot) = sessions.get(&peer) else {
                     return;
                 };
-                match decrypt_link_envelope(sess, &shared.self_name, &env) {
+                match slot.decrypt(&shared.self_name, &env) {
                     Ok(pt) => pt,
-                    Err(_) => {
-                        // Drop session only if the matching active sid failed decryption;
-                        // ignore late packets carrying an older superseded sid.
-                        if env.sid == sess.sid {
+                    Err((_, is_active_sid)) => {
+                        if is_active_sid {
                             sessions.remove(&peer);
                         }
                         return;

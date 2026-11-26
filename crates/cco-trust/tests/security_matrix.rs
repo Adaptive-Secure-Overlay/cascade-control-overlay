@@ -580,11 +580,7 @@ fn offline_admin_keygen_and_sign_registry_roundtrip() {
     // Create issuer key + trust root
     let issuer_sk = Ed25519SecretKey::generate();
     let issuer_path = dir.path().join("issuer.key");
-    fs::write(
-        &issuer_path,
-        format!("{}\n", &*issuer_sk.to_hex_zeroizing()),
-    )
-    .unwrap();
+    fs::write(&issuer_path, format!("{}\n", *issuer_sk.to_hex_zeroizing())).unwrap();
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;

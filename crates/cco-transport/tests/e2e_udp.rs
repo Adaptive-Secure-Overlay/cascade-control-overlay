@@ -407,6 +407,7 @@ from cryptography.hazmat.primitives import hashes
 from cryptography.hazmat.primitives.asymmetric import x25519
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 from cryptography.hazmat.primitives.kdf.hkdf import HKDF
+from cryptography.hazmat.primitives.serialization import Encoding, PublicFormat
 
 def jdump(obj):
     return json.dumps(obj, separators=(",", ":"), sort_keys=True).encode("utf-8")
@@ -445,7 +446,7 @@ while True:
         ni = bytes.fromhex(msg["ni"])
         i_pub = bytes.fromhex(msg["ke"])
         r_priv = x25519.X25519PrivateKey.generate()
-        r_pub = r_priv.public_key().public_bytes_raw()
+        r_pub = r_priv.public_key().public_bytes(Encoding.Raw, PublicFormat.Raw)
         nr = secrets.token_bytes(16)
         pending[sid] = (r_priv, ni, nr, i_pub, f"{{msg['from']}}-PY")
         sock.sendto(jdump({{

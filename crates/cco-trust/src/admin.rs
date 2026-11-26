@@ -193,14 +193,14 @@ pub fn generate_node_identity(
     let signing = Ed25519SecretKey::generate();
     let encryption = X25519SecretKey::generate();
 
-    let signing_line = Zeroizing::new(format!("{}\n", &*signing.to_hex_zeroizing()));
+    let signing_line = Zeroizing::new(format!("{}\n", *signing.to_hex_zeroizing()));
     write_new_file(
         &directory.join("signing.key"),
         signing_line.as_bytes(),
         true,
     )?;
 
-    let enc_line = Zeroizing::new(format!("{}\n", &*encryption.to_hex_zeroizing()));
+    let enc_line = Zeroizing::new(format!("{}\n", *encryption.to_hex_zeroizing()));
     write_new_file(&directory.join("encryption.key"), enc_line.as_bytes(), true)?;
 
     let verify_pub = signing.public_key();

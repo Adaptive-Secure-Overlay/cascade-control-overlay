@@ -206,28 +206,25 @@ fn sample_f4_hit(
     let mut hit = false;
     let limit = 2 + m;
 
-    for step in 0..j {
+    for &p_b in table.prob_pick_b_from_other.iter().take(j) {
         let next = if curr == 1 {
             // Currently at B: pick uniformly among all n - 1 nodes != B
             let r = rng.gen_range(0..(n - 1));
             if r == 0 { 0 } else { r + 1 }
+        } else if p_b > 0.0 && rng.r#gen::<f64>() < p_b {
+            1 // Transition to B
         } else {
-            let p_b = table.prob_pick_b_from_other[step];
-            if p_b > 0.0 && rng.r#gen::<f64>() < p_b {
-                1 // Transition to B
-            } else {
-                // Pick uniformly among the (n - 2) nodes excluding `curr` and `B = 1`
-                let r = rng.gen_range(0..(n - 2));
-                // Map 0..(n-2) onto {0..n} \ {1, curr}
-                let mut candidate = if r == 0 { 0 } else { r + 1 };
-                if curr == 0 {
-                    // Excluded {0, 1} -> remaining are {2..n}
-                    candidate = r + 2;
-                } else if candidate >= curr {
-                    candidate += 1;
-                }
-                candidate
+            // Pick uniformly among the (n - 2) nodes excluding `curr` and `B = 1`
+            let r = rng.gen_range(0..(n - 2));
+            // Map 0..(n-2) onto {0..n} \ {1, curr}
+            let mut candidate = if r == 0 { 0 } else { r + 1 };
+            if curr == 0 {
+                // Excluded {0, 1} -> remaining are {2..n}
+                candidate = r + 2;
+            } else if candidate >= curr {
+                candidate += 1;
             }
+            candidate
         };
         if next >= 2 && next < limit {
             hit = true;
