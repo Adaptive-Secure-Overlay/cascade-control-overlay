@@ -1,0 +1,112 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    name: Build ${{ matrix.asset_name }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-musl
+            asset_name: cco-linux-x86_64-musl
+            archive: tar.gz
+            bin: cco
+            musl: true
+          - os: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-musl
+            asset_name: cco-linux-aarch64-musl
+            archive: tar.gz
+            bin: cco
+            musl: true
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            asset_name: cco-windows-x86_64
+            archive: zip
+            bin: cco.exe
+            musl: false
+          - os: macos-latest
+            target: aarch64-apple-darwin
+            asset_name: cco-macos-aarch64
+            archive: tar.gz
+            bin: cco
+            musl: false
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install musl-tools
+        if: matrix.musl
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends musl-tools
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: release-${{ matrix.target }}
+
+      - name: Build release binary
+        run: cargo build --release --locked --target ${{ matrix.target }} -p cco-cli
+
+      - name: Package Unix archive
+        if: matrix.archive == 'tar.gz'
+        shell: bash
+        run: |
+          mkdir -p dist/stage
+          BIN="target/${{ matrix.target }}/release/${{ matrix.bin }}"
+          strip "$BIN" || true
+          cp "$BIN" "dist/stage/${{ matrix.bin }}"
+          cp README.md README.ru.md LICENSE-MIT LICENSE-APACHE dist/stage/
+          tar -C dist/stage -czf "dist/${{ matrix.asset_name }}.tar.gz" .
+          ls -lh "dist/${{ matrix.asset_name }}.tar.gz"
+
+      - name: Package Windows archive
+        if: matrix.archive == 'zip'
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path dist/stage | Out-Null
+          Copy-Item "target/${{ matrix.target }}/release/${{ matrix.bin }}" "dist/stage/${{ matrix.bin }}"
+          Copy-Item README.md, README.ru.md, LICENSE-MIT, LICENSE-APACHE dist/stage/
+          Compress-Archive -Path "dist/stage/*" -DestinationPath "dist/${{ matrix.asset_name }}.zip" -Force
+          Get-Item "dist/${{ matrix.asset_name }}.zip" | Select-Object Name, Length
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.asset_name }}
+          path: dist/${{ matrix.asset_name }}.${{ matrix.archive }}
+
+  publish:
+    name: Publish GitHub Release
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          path: release-assets
+          merge-multiple: true
+      - name: Generate SHA256SUMS.txt
+        run: |
+          cd release-assets
+          sha256sum * > SHA256SUMS.txt
+          cat SHA256SUMS.txt
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          generate_release_notes: true
+          files: release-assets/*

@@ -2,6 +2,14 @@
 
 All notable changes to `cascade-control-overlay` are documented in this file.
 
+## [0.1.1] - 2026-11-26
+
+### Changed & Fixed
+- **Security:** Upgraded `rusqlite` (`0.32 -> 0.43`, bundled `libsqlite3-sys 0.40`) to resolve `RUSTSEC-2026-0459` (SQLite CVE-2026-119375).
+- **Audit:** Added `.cargo/audit.toml` documenting the scoped offline benchmark exception (`RUSTSEC-2023-0071` in `cco-analytics` Table 4.6 RSA-3072 baseline) and switched CI security audit to `cargo-audit`.
+- **CI / L3 Lab:** Added Ubuntu 24.04 AppArmor profile handling for ephemeral `ip netns` strongSwan verification and fixed `umask` scoping + failure diagnostics in `lab/scripts/netns_e2e.sh` (all 7/7 CI jobs passing).
+- **Releases:** Added automated multi-platform GitHub Release workflow publishing binaries for Linux (`x86_64-musl`, `aarch64-musl`), Windows (`x86_64-msvc`), and macOS (`aarch64-apple-darwin`) with `SHA256SUMS.txt`.
+
 ## [0.1.0] - 2026-11-26
 
 ### Added
