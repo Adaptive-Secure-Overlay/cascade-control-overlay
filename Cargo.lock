@@ -301,6 +301,7 @@ dependencies = [
 name = "cco-transport"
 version = "0.2.0"
 dependencies = [
+ "base64",
  "cco-cascade",
  "cco-crypto",
  "cco-proto",
