@@ -1,0 +1,7 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">CCO Overlay</string>
+    <string name="vpn_channel_name">Cascade Control Overlay Tunnel</string>
+    <string name="vpn_notification_title">CCO Split-Plane Tunnel Active</string>
+    <string name="vpn_notification_text">WG Control via MCC Overlay · Direct Data Plane</string>
+</resources>
