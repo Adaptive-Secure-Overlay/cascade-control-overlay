@@ -150,3 +150,73 @@ All four combinations of the **2×2 factorial matrix (`{Python, Rust} × {IPsec,
 3. **Why WireGuard converges 2–4× faster than IPsec across both languages:** Standard IKEv2 (RFC 7296) requires **2 full round-trips** (`IKE_SA_INIT` + `IKE_AUTH`) before kernel XFRM installs `CHILD_SA` (`247–336 ms` warm, `529 ms` cold; single-RTT `CREATE_CHILD_SA` rekey drops to `88–204 ms`). WireGuard `Noise_IKpsk2` establishes session keys in **1 RTT** (`~146 ms` warm on Python + `wg0`, **`128.0 ms`** on Rust `boringtun`).
 4. **Userspace Rust `boringtun` matches Linux kernel `wg0` within `2.3%`:** On the exact same WAN link, 100% userspace `cco wg-tunnel` (`70.3 / 86.0 Mbps`) reaches **`97.7–97.8%`** of native Linux kernel `wg0` (`71.9 / 88.0 Mbps`) and matches kernel `strongSwan` XFRM (`69.2–71.0 / 86.6–87.3 Mbps`), while eliminating `wireguard.ko`, `strongSwan`, `nftables`, and `CAP_NET_RAW` — enabling rootless Android `VpnService`, signed Windows `Wintun`, and macOS `utun`.
 5. **Zero-loss seamless PFS rotation across all 4 cells & NAT-T `conntrack` fix (`74f84a0`):** Every cell in the 2×2 matrix rotated session keys under continuous ping with **`0.0%` packet loss** (`40/40`, `75/75`, `40/40`, `62/62`) and **`0` direct control-plane packets** on both host interfaces. Live dual-NAT testing also identified and fixed the Linux `conntrack` stickiness on `UDP/4500` via `output_raw` `notrack` rules for non-zero SPI (`ESP-in-UDP`) and `0x04000000` (`WireGuard Type 4`).
+
+---
+
+## 7. Arbitrary `m`-Hop `UniversalCascade` (`m = 2..10`, `F3`/`F4`, Linear `K` Parallel Chains)
+
+Commands:
+```bash
+# Multi-node localhost UDP benchmark (n = 14 nodes, j = 2 compromised, K = 2 parallel chains, m = 2,3,5,7,10)
+cargo run --release -p cco-cli -- bench cascade --nodes 14 --hops 2,3,5,7,10 --compromised 2 --parallel-chains 2 --hop-model f4 --protocol both --trials 3 --format both
+cargo run --release -p cco-cli -- bench cascade --nodes 14 --hops 2,3,5,7,10 --compromised 2 --parallel-chains 2 --hop-model f3 --protocol both --trials 3 --format both
+
+# Live 4-node Linux netns verification with F4 repeats for m = 3, 5, 10 (strongSwan + userspace WireGuard)
+for m in 3 5 10; do
+  sudo CCO_BIN=./target/release/cco CCO_ROUTE_MODE=cascade CCO_HOPS=$m CCO_HOP_MODEL=f4 CCO_PARALLEL_CHAINS=2 bash lab/scripts/netns_e2e.sh
+  sudo CCO_BIN=./target/release/cco CCO_ROUTE_MODE=cascade CCO_HOPS=$m CCO_HOP_MODEL=f4 CCO_PARALLEL_CHAINS=2 bash lab/scripts/wg_userspace_e2e.sh
+done
+```
+
+### 7.1 Multi-Node Localhost UDP Security-vs-Latency Curve (`n = 14`, `j = 2` Compromised, `K = 2` Chains, `3` Trials/Point)
+
+All `CASCADE_*` wire frames are constant-size padded to **`3,584 B`** (`2,048 B` inner payload block + `128 B` source guard) across every hop; direct control leakage was **`0`** on every point, and active relay cells matched `m` exactly (`active_relay_cells == m`).
+
+#### Model `F4` (Stochastic with Non-Adjacent Repeats Allowed, Zero `visited` Disclosure)
+
+| Protocol | `m` (Hops) | Median Handshake (ms) | Overlay UDP Pkts | Overlay KiB | Cascade Msgs | Process RSS (14 Nodes, MiB) | `P_F1` (%) | `P_F3` (%) | `P_F4` (%) | `H(F4)` (bits) |
+| :--- | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: |
+| `ipsec-ikev2` (2 RTT) | `2` | `7.26` | `491.3` | `473.7` | `44.7` | `14.2` | `31.82` | `29.30` | `29.30` | `7.29` |
+| `wireguard` (1 RTT) | `2` | **`4.36`** | `425.3` | `410.0` | `38.7` | `17.5` | `31.82` | `29.30` | `29.30` | `7.29` |
+| `ipsec-ikev2` (2 RTT) | `3` | `6.03` | `575.7` | `554.9` | `52.3` | `17.4` | `45.45` | `41.08` | `40.20` | `10.99` |
+| `wireguard` (1 RTT) | `3` | **`4.04`** | `487.7` | `470.1` | `44.3` | `18.6` | `45.45` | `41.08` | `40.20` | `10.99` |
+| `ipsec-ikev2` (2 RTT) | `5` | `6.29` | `729.7` | `703.5` | `66.3` | `18.1` | `68.18` | `61.44` | `57.18` | `18.40` |
+| `wireguard` (1 RTT) | `5` | **`5.05`** | `612.3` | `590.4` | `55.7` | `19.6` | `68.18` | `61.44` | `57.18` | `18.40` |
+| `ipsec-ikev2` (2 RTT) | `7` | `8.83` | `898.3` | `866.1` | `81.7` | `19.1` | `84.85` | `77.50` | `69.34` | `25.80` |
+| `wireguard` (1 RTT) | `7` | **`6.68`** | `744.3` | `717.5` | `67.7` | `20.3` | `84.85` | `77.50` | `69.34` | `25.80` |
+| `ipsec-ikev2` (2 RTT) | `10` | `10.47` | `1,158.7` | `1,117.1` | `105.3` | `20.5` | `98.48` | `93.57` | **`81.43`** | **`36.90`** |
+| `wireguard` (1 RTT) | `10` | **`7.34`** | `902.0` | `869.6` | `82.0` | `21.9` | `98.48` | `93.57` | **`81.43`** | **`36.90`** |
+
+#### Model `F3` (No-Repeat Decentralized Selection via `CASCADE_REJECT` Backtracking, Zero `visited` Disclosure)
+
+| Protocol | `m` (Hops) | Median Handshake (ms) | Overlay UDP Pkts | Overlay KiB | Cascade Msgs | Process RSS (14 Nodes, MiB) | `P_F1` (%) | `P_F3` (%) | `P_F4` (%) | `H(F3)` (bits) |
+| :--- | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: |
+| `ipsec-ikev2` (2 RTT) | `2` | `5.13` | `498.7` | `480.7` | `45.3` | `13.9` | `31.82` | `29.30` | `29.30` | `7.29` |
+| `wireguard` (1 RTT) | `2` | `4.56` | `425.3` | `409.9` | `38.7` | `16.3` | `31.82` | `29.30` | `29.30` | `7.29` |
+| `ipsec-ikev2` (2 RTT) | `3` | `4.64` | `568.3` | `547.9` | `51.7` | `16.6` | `45.45` | `41.08` | `40.20` | `10.88` |
+| `wireguard` (1 RTT) | `3` | `5.08` | `473.0` | `455.9` | `43.0` | `18.2` | `45.45` | `41.08` | `40.20` | `10.88` |
+| `ipsec-ikev2` (2 RTT) | `5` | `7.26` | `766.3` | `738.9` | `69.7` | `18.4` | `68.18` | `61.44` | `57.18` | `17.66` |
+| `wireguard` (1 RTT) | `5` | `5.24` | `634.3` | `611.4` | `57.7` | `19.7` | `68.18` | `61.44` | `57.18` | `17.66` |
+| `ipsec-ikev2` (2 RTT) | `7` | `8.89` | `964.3` | `929.9` | `87.7` | `19.3` | `84.85` | `77.50` | `69.34` | `23.83` |
+| `wireguard` (1 RTT) | `7` | `13.87` | `781.0` | `752.9` | `71.0` | `20.4` | `84.85` | `77.50` | `69.34` | `23.83` |
+| `ipsec-ikev2` (2 RTT) | `10` | `22.68` | `1,378.7` | `1,329.2` | `125.3` | `20.4` | `98.48` | `93.57` | `81.43` | `31.55` |
+| `wireguard` (1 RTT) | `10` | `16.85` | `1,056.0` | `1,018.1` | `96.0` | `21.3` | `98.48` | `93.57` | `81.43` | `31.55` |
+
+### 7.2 Live 4-Node Linux Kernel `ip netns` Verification (`A, X1, X2, B`, Model `F4`, `K = 2`)
+
+Confirmed on Linux `6.6` (`WSL2`) with unmodified `strongSwan 5.9.5` + `nftables` (`netns_e2e.sh`) and userspace `boringtun 0.7.1` + `/dev/net/tun` (`wg_userspace_e2e.sh`), including backward compatibility with default `mcc2`:
+
+| Lab Profile (4 Nodes `A, X1, X2, B`) | `route_mode` / `m` | Direct Control Leaks (`pcap`) | Overlay UDP Pkts (`pcap`) | Direct Data Pkts (`pcap`) | Handshake Latency | Tunnel ICMP (5 Probes) |
+| :--- | :---: | :---: | :---: | :---: | :---: | :---: |
+| `strongSwan` IPsec (default) | `mcc2` (`m = 2`) | **`0`** | `324` | `10` (`ESP`) | `< 150 ms` | `5/5`, `0%` loss |
+| `strongSwan` IPsec (`F4`, `K = 2`) | `cascade` (`m = 3`) | **`0`** | `520` | `10` (`ESP`) | — | `5/5`, avg `0.096 ms` |
+| `strongSwan` IPsec (`F4`, `K = 2`) | `cascade` (`m = 5`) | **`0`** | `698` | `10` (`ESP`) | — | `5/5`, avg `0.114 ms` |
+| `strongSwan` IPsec (`F4`, `K = 2`) | `cascade` (`m = 10`) | **`0`** | `1,345` | `10` (`ESP`) | — | `5/5`, avg `0.239 ms` |
+| Userspace WireGuard (default) | `mcc2` (`m = 2`) | **`0`** | `222` | `11` (`WG T4`) | — | `5/5`, `0%` loss |
+| Userspace WireGuard (`F4`, `K = 2`) | `cascade` (`m = 3`) | **`0`** | `300` | `11` (`WG T4`) | **`4 ms`** | `5/5`, avg `0.575 ms` |
+| Userspace WireGuard (`F4`, `K = 2`) | `cascade` (`m = 5`) | **`0`** | `629` | `11` (`WG T4`) | **`7 ms`** | `5/5`, avg `0.403 ms` |
+| Userspace WireGuard (`F4`, `K = 2`) | `cascade` (`m = 10`) | **`0`** | `1,080` | `11` (`WG T4`) | **`10 ms`** | `5/5`, avg `0.433 ms` |
+
+### Key Takeaways (`UniversalCascade` `m`-Hop Scaling)
+1. **Linear `O(K * m)` message budget vs exponential `O(2^m)` fanout:** With `K = 2` parallel chains, going from `m = 2` to `m = 10` (5× deeper cascade) grows `F4` cascade messages linearly (`44.7 -> 105.3` for IKEv2, `38.7 -> 82.0` for WireGuard) and keeps localhost handshake time under `10.5 ms` (IKEv2) / `7.34 ms` (WireGuard), while total RAM for all 14 live nodes stays `14–22 MiB` (`~1.0–1.6 MiB/node`).
+2. **Why `F4` outperforms `F3` both in security and latency at high `m/n`:** Under `n = 14`, `m = 10`, `F3` has only 12 distinct relays available and must reject/backtrack locally on random collisions without transmitting a `visited` list, increasing median setup time (`22.68 ms` vs `10.47 ms` for IKEv2; `16.85 ms` vs `7.34 ms` for WireGuard). Meanwhile `F4` simultaneously lowers the route compromise probability for `j = 2` compromised relays from `98.48%` (`F1`) and `93.57%` (`F3`) down to **`81.43%`** (`-17.05` pp vs `F1`), raises route entropy to **`36.90 bits`**, and works seamlessly even on the existing 4-node `{A, X1, X2, B}` lab for `m = 3, 5, 10`.

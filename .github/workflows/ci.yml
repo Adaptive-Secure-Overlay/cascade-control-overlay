@@ -74,6 +74,7 @@ jobs:
           cargo build --release -p cco-cli
           ./target/release/cco bench crypto --iters 50
           ./target/release/cco bench monte-carlo --trials 200000 --n 10 --m 2 --j 3
+          ./target/release/cco bench cascade --nodes 8 --hops 2,3,5 --compromised 1 --parallel-chains 2 --hop-model f4 --protocol both --trials 1 --format table
           ./target/release/cco wg-sim --format eve-json >/dev/null
 
   netns-l3-live:
@@ -99,10 +100,11 @@ jobs:
           done
       - name: Build release cco binary
         run: cargo build --release -p cco-cli
-      - name: Run live 4-node strongSwan overlay verification
+      - name: Run live 4-node strongSwan overlay verification (mcc2 + F4 5-hop cascade)
         run: |
           chmod +x lab/scripts/*.sh
           sudo CCO_BIN="$PWD/target/release/cco" bash lab/scripts/netns_e2e.sh
+          sudo CCO_BIN="$PWD/target/release/cco" CCO_ROUTE_MODE=cascade CCO_HOPS=5 CCO_HOP_MODEL=f4 CCO_PARALLEL_CHAINS=2 bash lab/scripts/netns_e2e.sh
 
   wg-userspace-l3-live:
     name: Live Linux netns + Userspace WireGuard (L3)
@@ -117,10 +119,11 @@ jobs:
           sudo apt-get install -y --no-install-recommends iproute2 tcpdump iputils-ping
       - name: Build release cco binary
         run: cargo build --release -p cco-cli
-      - name: Run live 4-node userspace WireGuard split-plane verification
+      - name: Run live 4-node userspace WireGuard split-plane verification (mcc2 + F4 5-hop cascade)
         run: |
           chmod +x lab/scripts/*.sh
           sudo CCO_BIN="$PWD/target/release/cco" bash lab/scripts/wg_userspace_e2e.sh
+          sudo CCO_BIN="$PWD/target/release/cco" CCO_ROUTE_MODE=cascade CCO_HOPS=5 CCO_HOP_MODEL=f4 CCO_PARALLEL_CHAINS=2 bash lab/scripts/wg_userspace_e2e.sh
 
   android-build:
     name: Android APK & JNI Build (arm64-v8a + x86_64)

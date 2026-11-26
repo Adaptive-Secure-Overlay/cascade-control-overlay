@@ -22,8 +22,11 @@
    - Прозрачный перехват только управляющего обмена: **IKEv2** (`IKE_SA_INIT`, `IKE_AUTH` на UDP/500 и UDP/4500 с Non-ESP Marker `00 00 00 00`) и **WireGuard handshake** (`type 1/2/3`, жесткий запрет на попадание `type 4` Transport Data в оверлей).
    - Прямой выход защищенного пользовательского трафика (**IPsec/ESP** или **WireGuard `type 4`**) между конечными узлами.
    - Linux-адаптер (`cco-linux-proxy`) на базе `nftables`, `IP_TRANSPARENT`, `IP_RECVORIGDSTADDR`, `SO_MARK` (`0x53`), `SOCK_RAW` (`IP_HDRINCL`) и обхода `ip xfrm policy`.
-3. **Обобщенный H-скачковый приватный каскад (`UniversalCascade`):**
-   - Чистая Sans-I/O state-машина для произвольной глубины `H >= 2` (`CASCADE_BUILD..CASCADE_CLOSE`), локальная изоляция ячеек `RelayCell`, обход при `CASCADE_REJECT` и пересборка при `CASCADE_ABORT`.
+3. **Обобщенный `m`-скачковый приватный каскад (`UniversalCascade`):**
+   - Подключен к живому UDP-транспорту (`cco-transport`), CLI (`cco node`, `cco wg-tunnel`), FFI (`cco-ffi`) и обоим протоколам (IPsec/IKEv2 и WireGuard): `--route-mode mcc2 | cascade --hops <m> --max-hops <M> --hop-model f3 | f4 --parallel-chains <K>`.
+   - Строгая маскировка знаний (role-limited knowledge) для любого `m >= 3`: `X1` знает только `A` и `X2`, `Xm` знает только `X(m-1)` и `B`, внутренний узел `Xk` (`2 <= k <= m - 1`) знает только `X(k-1)` и `X(k+1)`, инициатор `A` не знает `X2..Xm`, получатель `B` не знает `X1..X(m-1)`.
+   - Фиксированный размер всех `CASCADE_*` wire-пакетов (`3584 B`), отсутствие открытых полей `remaining`/`hops`/`visited`, непрозрачная хэш-цепочка `hop_token`/`stop_tag`, Ed25519-подпись капсулы и линейный бюджет `K` параллельных цепочек `O(K * m)` с дедупликацией на `B` (вместо экспоненциального `2^m`).
+   - Поддержка обеих моделей выбора следующего узла: `F3` (без повторов через локальный `CASCADE_REJECT`) и `F4` (стохастическая с разрешенными несмежными повторами, работает даже на 4-узловом стенде `{A, X1, X2, B}` при `m = 3, 5, 10`).
 4. **Аутентифицированный реестр доверенных узлов (`Trust Registry v2`):**
    - Схема `ipsec-ike-cascade-trust-registry/v2`: раздельные ключи `X25519` (шифрование) и `Ed25519` (подпись) на каждый узел, внешний закрепленный корень доверия (`pinned root`), строгий парсинг JSON без дубликатов, монотонный антиоткатный счетчик версий, атомарное обновление (`fsync + rename`) и восстановление `last-valid`.
    - Режим fail-closed: узел не открывает UDP-сокет без пройденной криптографической проверки реестра. Любые парольные fallback-механизмы полностью исключены.
@@ -85,16 +88,21 @@ cargo run --release -p cco-cli -- bench crypto --iters 200 --rsa-iters 20 --incl
 
 # 6. Каноническая матрица 27 сценариев WireGuard Handshake Overlay
 cargo run --release -p cco-cli -- wg-sim --format csv
+
+# 7. Многоузловой локальный UDP-бенчмарк UniversalCascade (n=14, m=2,3,5,7,10, F3/F4, K=2, IPsec + WG)
+cargo run --release -p cco-cli -- bench cascade --nodes 14 --hops 2,3,5,7,10 --compromised 2 --hop-model f4 --parallel-chains 2 --protocol both --trials 3
 ```
 
 ### Живая L3-проверка на Linux / WSL2 (strongSwan и userspace WireGuard)
 
 ```bash
 cargo build --release -p cco-cli
-# 1. Ядерный IPsec / strongSwan (IKEv2 через MCC, ESP напрямую)
+# 1. Ядерный IPsec / strongSwan (IKEv2 через MCC или m-hop каскад F4, ESP напрямую)
 sudo CCO_BIN=./target/release/cco bash lab/scripts/netns_e2e.sh
-# 2. Userspace WireGuard boringtun (WG Type 1/2/3 через MCC, WG Type 4 напрямую)
+sudo CCO_BIN=./target/release/cco CCO_ROUTE_MODE=cascade CCO_HOPS=5 CCO_HOP_MODEL=f4 CCO_PARALLEL_CHAINS=2 bash lab/scripts/netns_e2e.sh
+# 2. Userspace WireGuard boringtun (WG Type 1/2/3 через MCC или m-hop каскад F4, WG Type 4 напрямую)
 sudo CCO_BIN=./target/release/cco bash lab/scripts/wg_userspace_e2e.sh
+sudo CCO_BIN=./target/release/cco CCO_ROUTE_MODE=cascade CCO_HOPS=5 CCO_HOP_MODEL=f4 CCO_PARALLEL_CHAINS=2 bash lab/scripts/wg_userspace_e2e.sh
 ```
 
 Оба стенда поднимают 5 изолированных сетевых пространств имен Linux (`cco-isp` с мостом и `tcpdump`, `cco-A`, `cco-X1`, `cco-X2`, `cco-B`), прогоняют ICMP-трафик через `198.51.100.10 <-> 198.51.100.13` и автоматически проверяют pcap:

@@ -13,7 +13,7 @@ This repository ports and hardens the research software suite developed within a
 
 1. **Multiple Start Connections (MCC / МСС):** cascade fanout of `N` functionally equivalent handshake copies across `A -> X1 -> X2 -> B` with receiver-side branch selection (`first`, `window`, `adaptive`, `wait-all`), end-to-end Ed25519 signatures, X25519+HKDF-SHA256+AES-256-GCM hop/endpoint capsules, opaque continuation tokens (initiator `A` never learns selected `X2`), and a durable SQLite at-most-once anti-replay ledger.
 2. **Unmodified VPN Control-Plane Overlay:** transparent Linux `nftables` + `IP_TRANSPARENT` + `SO_MARK` (`0x53`) + `SOCK_RAW` capture and injection for **IKEv2** (`IKE_SA_INIT` and `IKE_AUTH` over UDP/500 and UDP/4500 with Non-ESP Marker `00 00 00 00`) and **WireGuard handshakes** (`type 1/2/3`), while user traffic (**IPsec ESP** or **WireGuard `type 4`**) flows directly between endpoints.
-3. **Universal H-Hop Privacy Cascade (`UniversalCascade`):** Sans-I/O state machine generalizing private relay routing to arbitrary hop count `H >= 2` with local-handle cell isolation, reroute on `CASCADE_REJECT`, and route rebuild on `CASCADE_ABORT`.
+3. **Universal `m`-Hop Privacy Cascade (`UniversalCascade`):** Live UDP + Sans-I/O decentralized multi-hop routing (`--route-mode cascade --hops <m> --hop-model f3|f4 --parallel-chains <K>`) for both **IPsec/IKEv2** and **WireGuard** across arbitrary hop counts (`m = 2..16+`), with role-limited knowledge isolation (`Xk` knows only `X(k-1)` and `X(k+1)`), constant `3,584 B` wire padding, opaque SHA-256 `hop_token`/`stop_tag` termination without plaintext `remaining`/`visited`, Ed25519-signed capsules, and linear `O(K * m)` parallel chain deduplication (replacing exponential `2^m` fanout).
 4. **Authenticated Trust Registry v2:** fail-closed Ed25519-signed node directory (`ipsec-ike-cascade-trust-registry/v2`) with separate `X25519` encryption and `Ed25519` verification keys per node, pinned external trust root, strict monotonic anti-rollback version state, SHA-256 integrity checks, and atomic `fsync` + `rename` backup recovery.
 5. **Combinatorial & Monte Carlo Security Analytics:** exact arbitrary-precision route-space models (`F1/Tor`, `I2P`, `F3` without repetitions, `F4` with non-adjacent repetitions and endpoint transit), exact compromise probability and `n50` threshold computation, and multi-threaded `rayon` Monte Carlo verification (2.4M routes in ~6.5 ms).
 
@@ -76,6 +76,9 @@ cargo run --release -p cco-cli -- bench crypto --iters 200 --rsa-iters 20 --incl
 
 # Canonical 27-scenario WireGuard handshake overlay matrix
 cargo run --release -p cco-cli -- wg-sim --format csv
+
+# Multi-node localhost UDP cascade benchmark (n=14, m=2,3,5,7,10, F3/F4, K=2, IPsec + WireGuard)
+cargo run --release -p cco-cli -- bench cascade --nodes 14 --hops 2,3,5,7,10 --compromised 2 --hop-model f4 --parallel-chains 2 --protocol both --trials 3
 ```
 
 ---
