@@ -11,8 +11,11 @@ use cco_analytics::{
     uniform_entropy,
 };
 use cco_cascade::mcc::{EndpointSecurity, MccFanout, SelectionMode, SelectionPolicy};
+use cco_cascade::universal::{DEFAULT_MAX_HOPS, DEFAULT_PARALLEL_CHAINS, HopSelectionModel};
 use cco_crypto::{Ed25519SecretKey, X25519SecretKey, decode_canonical_hex};
-use cco_transport::{NodeTransportConfig, PeerEndpoint, SocketProtector};
+use cco_transport::{
+    CascadeTransportConfig, NodeTransportConfig, PeerEndpoint, RouteMode, SocketProtector,
+};
 use cco_trust::{
     NodeKeyRecord, RegistryStatus, VerifyConstraints, build_trust_root_bytes, sign_registry_v2,
     verify_registry_bytes,
@@ -41,6 +44,21 @@ pub struct FfiTunnelConfig {
     pub replay_db_path: PathBuf,
     #[serde(default = "default_mcc_mode")]
     pub mcc_mode: String,
+    /// Control-plane routing architecture: `"mcc2"` (default) or `"cascade"` (Universal H-hop).
+    #[serde(default = "default_route_mode")]
+    pub route_mode: String,
+    /// Number of intermediate cascade hops `m` (`2..=max_hops`) when `route_mode == "cascade"`.
+    #[serde(default = "default_cascade_hops", alias = "hops")]
+    pub cascade_hops: usize,
+    /// Maximum permitted cascade hop count (`>= 2`).
+    #[serde(default = "default_max_hops")]
+    pub max_hops: usize,
+    /// Next-hop selection model for `cascade`: `"f3"` (no repeats) or `"f4"` (with repeats).
+    #[serde(default = "default_hop_model")]
+    pub hop_model: String,
+    /// Linear parallel independent chains `K` (`O(K * m)` budget) when `route_mode == "cascade"`.
+    #[serde(default = "default_parallel_chains")]
+    pub parallel_chains: usize,
     #[serde(default = "default_fanout")]
     pub x1_fanout: usize,
     #[serde(default = "default_fanout")]
@@ -66,6 +84,21 @@ pub struct FfiTunnelConfig {
 
 fn default_mcc_mode() -> String {
     "adaptive".to_owned()
+}
+fn default_route_mode() -> String {
+    "mcc2".to_owned()
+}
+const fn default_cascade_hops() -> usize {
+    3
+}
+const fn default_max_hops() -> usize {
+    DEFAULT_MAX_HOPS
+}
+fn default_hop_model() -> String {
+    "f4".to_owned()
+}
+const fn default_parallel_chains() -> usize {
+    DEFAULT_PARALLEL_CHAINS
 }
 const fn default_fanout() -> usize {
     2
@@ -447,7 +480,30 @@ fn parse_and_verify_config(
     };
     policy.validate().map_err(|e| e.code().to_owned())?;
 
+    let route_mode = match raw.route_mode.as_str() {
+        "mcc2" => RouteMode::Mcc2,
+        "cascade" => RouteMode::Cascade,
+        _ => return Err("unsupported_route_mode".to_owned()),
+    };
+    let hop_model = match raw.hop_model.as_str() {
+        "f3" | "F3" => HopSelectionModel::F3NoRep,
+        "f4" | "F4" => HopSelectionModel::F4WithRep,
+        _ => return Err("unsupported_hop_model".to_owned()),
+    };
+    if route_mode == RouteMode::Cascade && (raw.cascade_hops < 2 || raw.cascade_hops > raw.max_hops)
+    {
+        return Err("invalid_hop_count".to_owned());
+    }
+
     let mut overlay = NodeTransportConfig::new(&raw.node_name, bind_addr, peers);
+    overlay.route_mode = route_mode;
+    overlay.cascade = CascadeTransportConfig {
+        hops: raw.cascade_hops,
+        max_hops: raw.max_hops.max(raw.cascade_hops).max(2),
+        hop_model,
+        parallel_chains: raw.parallel_chains,
+        route_ttl_secs: 120.0,
+    };
     overlay.fanout = MccFanout {
         x1: raw.x1_fanout,
         x2: raw.x2_fanout,

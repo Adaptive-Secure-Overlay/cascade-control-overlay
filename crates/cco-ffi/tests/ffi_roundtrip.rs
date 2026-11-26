@@ -316,3 +316,191 @@ fn c_abi_channel_tunnel_four_node_split_wireguard_roundtrip() {
         }
     });
 }
+
+#[test]
+#[allow(unsafe_code)]
+fn c_abi_channel_tunnel_f4_five_hop_cascade_roundtrip() {
+    let dir = TempDir::new().unwrap();
+    let names = ["A", "X1", "X2", "B"];
+    let root_sk = Ed25519SecretKey::generate();
+    let mut signers = BTreeMap::new();
+    signers.insert("ffi-cascade-root".to_owned(), root_sk.public_key());
+    let root_bytes = build_trust_root_bytes(&signers).unwrap();
+    let root_json = String::from_utf8(root_bytes.clone()).unwrap();
+    let root_path = dir.path().join("root.json");
+    std::fs::write(&root_path, &root_bytes).unwrap();
+
+    let ports = pick_free_udp_ports(6);
+    let mut signing = BTreeMap::new();
+    let mut encryption = BTreeMap::new();
+    let mut records = BTreeMap::new();
+    let mut peers_vec = Vec::new();
+    let mut peers_map = BTreeMap::new();
+
+    for (i, &name) in names.iter().enumerate() {
+        let esk = Ed25519SecretKey::generate();
+        let xsk = X25519SecretKey::generate();
+        records.insert(
+            name.to_owned(),
+            NodeKeyRecord {
+                encryption: xsk.public_key(),
+                verification: esk.public_key(),
+                key_id: esk.public_key().key_id(),
+                revoked: false,
+            },
+        );
+        signing.insert(name.to_owned(), esk);
+        encryption.insert(name.to_owned(), xsk);
+        let ep = PeerEndpoint {
+            name: name.to_owned(),
+            overlay_addr: SocketAddr::from(([127, 0, 0, 1], ports[i])),
+            underlay_ip: Ipv4Addr::new(192, 0, 2, (10 + i) as u8),
+        };
+        peers_vec.push(ep.clone());
+        peers_map.insert(name.to_owned(), ep);
+    }
+
+    let reg_bytes = sign_registry_v2(1, &records, "ffi-cascade-root", &root_sk).unwrap();
+    let verified = verify_registry_bytes(
+        &reg_bytes,
+        &root_path,
+        names.iter().copied(),
+        VerifyConstraints::default(),
+    )
+    .unwrap();
+    let reg_json = String::from_utf8(reg_bytes).unwrap();
+
+    let relay_rt = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .enable_all()
+        .build()
+        .unwrap();
+    let now_s = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_secs() as i64;
+    let relays = relay_rt.block_on(async {
+        let mut hs = Vec::new();
+        for &relay in &["X1", "X2"] {
+            let sec = EndpointSecurity::new(
+                relay,
+                verified.clone(),
+                Ed25519SecretKey::from_bytes(*signing[relay].to_bytes_zeroizing()),
+                X25519SecretKey::from_bytes(*encryption[relay].to_bytes_zeroizing()),
+                dir.path().join(format!("{relay}.sqlite")),
+                now_s,
+            )
+            .unwrap();
+            let mut cfg =
+                NodeTransportConfig::new(relay, peers_map[relay].overlay_addr, peers_map.clone());
+            cfg.route_mode = cco_transport::RouteMode::Cascade;
+            cfg.cascade.hops = 5;
+            cfg.cascade.hop_model = cco_cascade::universal::HopSelectionModel::F4WithRep;
+            cfg.cascade.parallel_chains = 2;
+            hs.push(
+                OverlayNode::start(cfg, sec, Arc::new(RelayOnlySink))
+                    .await
+                    .unwrap(),
+            );
+        }
+        hs
+    });
+
+    let wg_sk_a = X25519SecretKey::generate();
+    let wg_sk_b = X25519SecretKey::generate();
+    let cfg_b = json!({
+        "node_name": "B",
+        "peer_name": "A",
+        "peers": peers_vec,
+        "trust_registry_json": reg_json,
+        "trust_root_json": root_json,
+        "signing_key_hex": *signing["B"].to_hex_zeroizing(),
+        "encryption_key_hex": *encryption["B"].to_hex_zeroizing(),
+        "wg_private_key_hex": *wg_sk_b.to_hex_zeroizing(),
+        "peer_wg_public_key_hex": wg_sk_a.public_key().to_hex(),
+        "direct_bind_addr": format!("127.0.0.1:{}", ports[5]),
+        "peer_direct_addr": format!("127.0.0.1:{}", ports[4]),
+        "replay_db_path": dir.path().join("B.sqlite"),
+        "route_mode": "cascade",
+        "cascade_hops": 5,
+        "max_hops": 16,
+        "hop_model": "f4",
+        "parallel_chains": 2,
+        "initiate_handshake": false
+    });
+    let cfg_a = json!({
+        "node_name": "A",
+        "peer_name": "B",
+        "peers": peers_vec,
+        "trust_registry_json": reg_json,
+        "trust_root_json": root_json,
+        "signing_key_hex": *signing["A"].to_hex_zeroizing(),
+        "encryption_key_hex": *encryption["A"].to_hex_zeroizing(),
+        "wg_private_key_hex": *wg_sk_a.to_hex_zeroizing(),
+        "peer_wg_public_key_hex": wg_sk_b.public_key().to_hex(),
+        "direct_bind_addr": format!("127.0.0.1:{}", ports[4]),
+        "peer_direct_addr": format!("127.0.0.1:{}", ports[5]),
+        "replay_db_path": dir.path().join("A.sqlite"),
+        "route_mode": "cascade",
+        "cascade_hops": 5,
+        "max_hops": 16,
+        "hop_model": "f4",
+        "parallel_chains": 2,
+        "initiate_handshake": false
+    });
+
+    let cfg_b_c = CString::new(cfg_b.to_string()).unwrap();
+    let cfg_a_c = CString::new(cfg_a.to_string()).unwrap();
+    let mut err_ptr: *mut std::ffi::c_char = ptr::null_mut();
+
+    let handle_b = unsafe { cco_tunnel_start_channel(cfg_b_c.as_ptr(), &mut err_ptr) };
+    assert!(!handle_b.is_null());
+    let handle_a = unsafe { cco_tunnel_start_channel(cfg_a_c.as_ptr(), &mut err_ptr) };
+    assert!(!handle_a.is_null());
+
+    std::thread::sleep(Duration::from_millis(250));
+
+    let pkt = build_ipv4_udp(
+        Ipv4Addr::new(198, 51, 100, 10),
+        Ipv4Addr::new(198, 51, 100, 13),
+        51000,
+        51001,
+        b"c-abi-5hop-f4-cascade",
+    );
+    assert_eq!(
+        unsafe { cco_tunnel_push_outbound_ip(handle_a, pkt.as_ptr(), pkt.len()) },
+        0
+    );
+
+    let mut recv_buf = vec![0u8; 4096];
+    let mut got_len = 0isize;
+    for _ in 0..100 {
+        got_len =
+            unsafe { cco_tunnel_pop_inbound_ip(handle_b, recv_buf.as_mut_ptr(), recv_buf.len()) };
+        if got_len > 0 {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    assert_eq!(got_len as usize, pkt.len());
+    assert_eq!(&recv_buf[..pkt.len()], pkt.as_slice());
+
+    let stats_raw = take_c_string(unsafe { cco_tunnel_stats(handle_a) });
+    let stats: Value = serde_json::from_str(&stats_raw).unwrap();
+    assert_eq!(stats["ok"], true);
+    assert_eq!(stats["data"]["route_mode"], "cascade");
+    assert_eq!(stats["data"]["hop_model"], "f4");
+    assert_eq!(stats["data"]["selected_route_hops"], 5);
+    assert_eq!(stats["data"]["parallel_chains"], 2);
+    assert_eq!(stats["data"]["direct_handshake_tx"], 0);
+
+    unsafe {
+        cco_tunnel_stop(handle_a);
+        cco_tunnel_stop(handle_b);
+    }
+    relay_rt.block_on(async {
+        for r in relays {
+            r.shutdown().await;
+        }
+    });
+}

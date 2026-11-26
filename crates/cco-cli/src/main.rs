@@ -8,6 +8,8 @@
 //! - `analytics`: exact Chapter 3 combinatorics, `n50` thresholds, and `rayon` Monte Carlo simulation.
 //! - `bench`: cryptographic (X25519 vs RSA-3072) and Monte Carlo benchmarks.
 
+mod cascade_bench;
+
 use std::collections::BTreeMap;
 use std::fs::{self, OpenOptions};
 use std::io::Write;
@@ -22,6 +24,7 @@ use cco_analytics::{
     simulate_compromise_monte_carlo, threshold_n50, uniform_entropy,
 };
 use cco_cascade::mcc::{EndpointSecurity, MccFanout, SelectionMode, SelectionPolicy};
+use cco_cascade::universal::{DEFAULT_MAX_HOPS, DEFAULT_PARALLEL_CHAINS, HopSelectionModel};
 use cco_cascade::wireguard::{
     format_scenarios_csv, run_canonical_27_eve_results, run_canonical_27_scenarios,
 };
@@ -30,7 +33,10 @@ use cco_linux_proxy::{
     DEFAULT_CAPTURE_BASE_500, DEFAULT_CAPTURE_BASE_4500, DEFAULT_SOCKET_MARK, IkeProxyConfig,
     LinuxIkeProxy, render_nftables_rules, render_xfrm_bypass_script,
 };
-use cco_transport::{IkeSink, NodeTransportConfig, OverlayNode, PeerEndpoint, RelayOnlySink};
+use cco_transport::{
+    CascadeTransportConfig, IkeSink, NodeTransportConfig, OverlayNode, PeerEndpoint, RelayOnlySink,
+    RouteMode,
+};
 use cco_trust::{
     TrustRegistryStore, VerifyConstraints, build_trust_root_bytes, generate_node_identity,
     read_ed25519_key_file, read_x25519_key_file, sign_registry_files, verify_registry_bytes,
@@ -159,6 +165,26 @@ struct NodeArgs {
     #[arg(long)]
     replay_db: PathBuf,
 
+    /// Control-plane routing architecture: 2-hop MCC (`mcc2`) or H-hop UniversalCascade (`cascade`).
+    #[arg(long, value_enum, default_value_t = CliRouteMode::Mcc2)]
+    route_mode: CliRouteMode,
+
+    /// Number of intermediate cascade hops `m` (`2..=max_hops`) in `cascade` mode.
+    #[arg(long = "hops", alias = "cascade-hops", default_value_t = 3)]
+    cascade_hops: usize,
+
+    /// Maximum permitted cascade hop count enforced by relays and endpoints.
+    #[arg(long, default_value_t = DEFAULT_MAX_HOPS)]
+    max_hops: usize,
+
+    /// Next-hop selection model in `cascade` mode (`f3` no-repeat or `f4` stochastic with repeats).
+    #[arg(long, value_enum, default_value_t = CliHopModel::F4)]
+    hop_model: CliHopModel,
+
+    /// Number of parallel independent chains `K` (`O(K * m)` packet budget) in `cascade` mode.
+    #[arg(long, default_value_t = DEFAULT_PARALLEL_CHAINS)]
+    parallel_chains: usize,
+
     /// Receiver-side MCC branch selection mode.
     #[arg(long, value_enum, default_value_t = CliSelectionMode::First)]
     mode: CliSelectionMode,
@@ -249,6 +275,21 @@ struct WgTunnelArgs {
     /// Linux TUN interface name to create/attach (e.g., `cco0`).
     #[arg(long, default_value = "cco0")]
     tun_name: String,
+    /// Control-plane routing architecture: 2-hop MCC (`mcc2`) or H-hop UniversalCascade (`cascade`).
+    #[arg(long, value_enum, default_value_t = CliRouteMode::Mcc2)]
+    route_mode: CliRouteMode,
+    /// Number of intermediate cascade hops `m` (`2..=max_hops`) in `cascade` mode.
+    #[arg(long = "hops", alias = "cascade-hops", default_value_t = 3)]
+    cascade_hops: usize,
+    /// Maximum permitted cascade hop count enforced by relays and endpoints.
+    #[arg(long, default_value_t = DEFAULT_MAX_HOPS)]
+    max_hops: usize,
+    /// Next-hop selection model in `cascade` mode (`f3` no-repeat or `f4` stochastic with repeats).
+    #[arg(long, value_enum, default_value_t = CliHopModel::F4)]
+    hop_model: CliHopModel,
+    /// Number of parallel independent chains `K` (`O(K * m)` packet budget) in `cascade` mode.
+    #[arg(long, default_value_t = DEFAULT_PARALLEL_CHAINS)]
+    parallel_chains: usize,
     #[arg(long, value_enum, default_value_t = CliSelectionMode::First)]
     mode: CliSelectionMode,
     #[arg(long, default_value_t = 2)]
@@ -275,6 +316,50 @@ enum CliSelectionMode {
     Window,
     Adaptive,
     WaitAll,
+}
+
+#[derive(ValueEnum, Debug, Clone, Copy)]
+enum CliRouteMode {
+    Mcc2,
+    Cascade,
+}
+
+impl From<CliRouteMode> for RouteMode {
+    fn from(value: CliRouteMode) -> Self {
+        match value {
+            CliRouteMode::Mcc2 => Self::Mcc2,
+            CliRouteMode::Cascade => Self::Cascade,
+        }
+    }
+}
+
+#[derive(ValueEnum, Debug, Clone, Copy)]
+enum CliHopModel {
+    F3,
+    F4,
+}
+
+impl From<CliHopModel> for HopSelectionModel {
+    fn from(value: CliHopModel) -> Self {
+        match value {
+            CliHopModel::F3 => Self::F3NoRep,
+            CliHopModel::F4 => Self::F4WithRep,
+        }
+    }
+}
+
+#[derive(ValueEnum, Debug, Clone, Copy)]
+enum CliBenchProtocol {
+    Both,
+    Ipsec,
+    Wireguard,
+}
+
+#[derive(ValueEnum, Debug, Clone, Copy)]
+enum CliBenchFormat {
+    Both,
+    Table,
+    Json,
 }
 
 #[derive(Subcommand, Debug)]
@@ -427,6 +512,37 @@ enum BenchCmd {
         #[arg(long, default_value_t = 3)]
         j: usize,
     },
+    /// Multi-node localhost UDP benchmark across arbitrary cascade hops (`m = 2,3,5,7,10`)
+    /// for IPsec & WireGuard paired with `cco-analytics` F1/F3/F4 compromise probabilities.
+    Cascade {
+        /// Total nodes `n` in the local UDP overlay pool (e.g., 12..16).
+        #[arg(long, default_value_t = 14)]
+        nodes: usize,
+        /// Comma-separated list of intermediate hop counts `m`.
+        #[arg(long, value_delimiter = ',', default_values_t = vec![2, 3, 5, 7, 10])]
+        hops: Vec<usize>,
+        /// Number of compromised relay nodes `j` for `cco-analytics` F1/F3/F4 compromise risk.
+        #[arg(long = "compromised", alias = "j", default_value_t = 2)]
+        compromised: usize,
+        /// Next-hop model (`f3` no repeats, `f4` with non-adjacent repeats).
+        #[arg(long, value_enum, default_value_t = CliHopModel::F4)]
+        hop_model: CliHopModel,
+        /// Linear parallel independent chains `K` (`O(K * m)` budget).
+        #[arg(long, default_value_t = DEFAULT_PARALLEL_CHAINS)]
+        parallel_chains: usize,
+        /// Protocols to benchmark (`both`, `ipsec`, `wireguard`).
+        #[arg(long, value_enum, default_value_t = CliBenchProtocol::Both)]
+        protocol: CliBenchProtocol,
+        /// Handshake trials per `(protocol, m)` point.
+        #[arg(long, default_value_t = 3)]
+        trials: usize,
+        /// Output format (`both`, `table`, `json`).
+        #[arg(long, value_enum, default_value_t = CliBenchFormat::Both)]
+        format: CliBenchFormat,
+        /// Optional path to write the structured JSON benchmark report.
+        #[arg(long)]
+        json_out: Option<PathBuf>,
+    },
 }
 
 #[tokio::main]
@@ -455,7 +571,7 @@ async fn run(cli: Cli) -> Result<(), String> {
         Commands::WgKeygen { key_out } => run_wg_keygen(key_out.as_deref()),
         Commands::WgTunnel(args) => run_wg_tunnel(args).await,
         Commands::Analytics { action } => run_analytics(action),
-        Commands::Bench { action } => run_bench(action),
+        Commands::Bench { action } => run_bench(action).await,
         Commands::RenderFirewall {
             name,
             peers,
@@ -546,6 +662,14 @@ async fn run_node(args: NodeArgs) -> Result<(), String> {
         .map(|(k, v)| (k.clone(), v.underlay_ip))
         .collect();
     let mut cfg = NodeTransportConfig::new(&args.name, bind_addr, peers);
+    cfg.route_mode = args.route_mode.into();
+    cfg.cascade = CascadeTransportConfig {
+        hops: args.cascade_hops,
+        max_hops: args.max_hops.max(args.cascade_hops).max(2),
+        hop_model: args.hop_model.into(),
+        parallel_chains: args.parallel_chains,
+        route_ttl_secs: 120.0,
+    };
     cfg.fanout = MccFanout {
         x1: args.x1_fanout,
         x2: args.x2_fanout,
@@ -833,6 +957,14 @@ async fn run_wg_tunnel(args: WgTunnelArgs) -> Result<(), String> {
     policy.validate().map_err(|e| e.code().to_owned())?;
 
     let mut overlay = NodeTransportConfig::new(&args.name, bind_addr, peers);
+    overlay.route_mode = args.route_mode.into();
+    overlay.cascade = CascadeTransportConfig {
+        hops: args.cascade_hops,
+        max_hops: args.max_hops.max(args.cascade_hops).max(2),
+        hop_model: args.hop_model.into(),
+        parallel_chains: args.parallel_chains,
+        route_ttl_secs: 120.0,
+    };
     overlay.fanout = MccFanout {
         x1: args.x1_fanout,
         x2: args.x2_fanout,
@@ -1003,7 +1135,7 @@ fn run_analytics(action: AnalyticsCmd) -> Result<(), String> {
     }
 }
 
-fn run_bench(action: BenchCmd) -> Result<(), String> {
+async fn run_bench(action: BenchCmd) -> Result<(), String> {
     match action {
         BenchCmd::Crypto {
             iters,
@@ -1034,6 +1166,40 @@ fn run_bench(action: BenchCmd) -> Result<(), String> {
                 serde_json::to_string_pretty(&reports).map_err(|_| "json_error".to_owned())?
             );
             Ok(())
+        }
+        BenchCmd::Cascade {
+            nodes,
+            hops,
+            compromised,
+            hop_model,
+            parallel_chains,
+            protocol,
+            trials,
+            format,
+            json_out,
+        } => {
+            let proto = match protocol {
+                CliBenchProtocol::Both => cascade_bench::BenchProtocolFilter::Both,
+                CliBenchProtocol::Ipsec => cascade_bench::BenchProtocolFilter::Ipsec,
+                CliBenchProtocol::Wireguard => cascade_bench::BenchProtocolFilter::Wireguard,
+            };
+            let fmt_str = match format {
+                CliBenchFormat::Both => "both",
+                CliBenchFormat::Table => "table",
+                CliBenchFormat::Json => "json",
+            };
+            cascade_bench::run_cascade_benchmark(
+                nodes,
+                &hops,
+                compromised,
+                hop_model.into(),
+                parallel_chains,
+                proto,
+                trials,
+                fmt_str,
+                json_out.as_deref(),
+            )
+            .await
         }
     }
 }
