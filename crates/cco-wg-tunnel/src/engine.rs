@@ -59,7 +59,8 @@ pub struct WgTunnelConfig {
 
 struct SharedTunnel {
     peer_name: String,
-    peer_direct_addr: SocketAddr,
+    /// Dynamic direct UDP endpoint; updated only after Poly1305 AEAD verification of inbound Type 4.
+    peer_direct_addr: StdMutex<SocketAddr>,
     tunn: StdMutex<Tunn>,
     direct_socket: UdpSocket,
     tun: Arc<dyn TunDevice>,
@@ -109,7 +110,7 @@ impl IkeSink for WgOverlayControlSink {
         );
 
         let selected_x1 = (!meta.x1.is_empty()).then_some(meta.x1);
-        let (net_out, tun_out, session_established) =
+        let (net_out, tun_out, session_established, _) =
             decapsulate_wg_into_queues(&self.shared.tunn, &payload);
 
         if session_established || parsed.message_type == WireGuardMessageType::HandshakeResponse {
@@ -263,7 +264,7 @@ impl SplitWireGuardTunnel {
         let (outbound_wg_tx, mut outbound_wg_rx) = mpsc::channel::<Vec<u8>>(512);
         let shared = Arc::new(SharedTunnel {
             peer_name: config.peer_name.clone(),
-            peer_direct_addr: config.peer_direct_addr,
+            peer_direct_addr: StdMutex::new(config.peer_direct_addr),
             tunn: StdMutex::new(tunn),
             direct_socket,
             tun,
@@ -371,7 +372,7 @@ impl SplitWireGuardTunnel {
                         }
                         recv_res = shared_in.direct_socket.recv_from(&mut buf) => {
                             match recv_res {
-                                Ok((n, _src)) if n > 0 => {
+                                Ok((n, src)) if n > 0 => {
                                     let pkt = &buf[..n];
                                     let Ok(parsed) = parse_wireguard_packet(pkt) else {
                                         continue;
@@ -390,6 +391,19 @@ impl SplitWireGuardTunnel {
                                         continue;
                                     }
 
+                                    let (net_out, tun_out, _, authenticated) =
+                                        decapsulate_wg_into_queues(&shared_in.tunn, pkt);
+                                    if authenticated {
+                                        let mut addr_guard = shared_in
+                                            .peer_direct_addr
+                                            .lock()
+                                            .expect("peer_direct_addr mutex poisoned");
+                                        if *addr_guard != src {
+                                            info!(peer = %shared_in.peer_name, %src, "updated authenticated WG direct NAT endpoint");
+                                            *addr_guard = src;
+                                        }
+                                    }
+
                                     shared_in.telemetry.update(|s| {
                                         s.direct_data_rx = s.direct_data_rx.saturating_add(1);
                                         s.direct_bytes_rx =
@@ -399,8 +413,6 @@ impl SplitWireGuardTunnel {
                                         }
                                     });
 
-                                    let (net_out, tun_out, _) =
-                                        decapsulate_wg_into_queues(&shared_in.tunn, pkt);
                                     for out_pkt in net_out {
                                         let _ = shared_in.outbound_wg_tx.try_send(out_pkt);
                                     }
@@ -521,11 +533,11 @@ async fn route_wg_outbound(
     } else {
         // WireGuard Type 4 Transport Data -> direct UDP A <-> B!
         let len = pkt.len() as u64;
-        match shared
-            .direct_socket
-            .send_to(&pkt, shared.peer_direct_addr)
-            .await
-        {
+        let peer_addr = *shared
+            .peer_direct_addr
+            .lock()
+            .expect("peer_direct_addr mutex poisoned");
+        match shared.direct_socket.send_to(&pkt, peer_addr).await {
             Ok(_) => {
                 shared.telemetry.update(|s| {
                     s.direct_data_tx = s.direct_data_tx.saturating_add(1);
@@ -545,15 +557,17 @@ async fn route_wg_outbound(
 fn decapsulate_wg_into_queues(
     tunn_mutex: &StdMutex<Tunn>,
     datagram: &[u8],
-) -> (Vec<Vec<u8>>, Vec<Vec<u8>>, bool) {
+) -> (Vec<Vec<u8>>, Vec<Vec<u8>>, bool, bool) {
     let mut net_out = Vec::new();
     let mut tun_out = Vec::new();
     let mut session_established = false;
+    let mut authenticated = false;
     let mut dst = vec![0u8; WG_BUF_SIZE];
 
     let mut tunn = tunn_mutex.lock().expect("boringtun mutex poisoned");
     match tunn.decapsulate(None, datagram, &mut dst) {
         TunnResult::WriteToNetwork(pkt) => {
+            authenticated = true;
             if let Ok(parsed) = parse_wireguard_packet(pkt) {
                 if parsed.is_transport() {
                     // Keepalive type 4 emitted immediately after completing handshake!
@@ -567,13 +581,17 @@ fn decapsulate_wg_into_queues(
             }
         }
         TunnResult::WriteToTunnelV4(ip, _) | TunnResult::WriteToTunnelV6(ip, _) => {
+            authenticated = true;
             session_established = true;
             tun_out.push(ip.to_vec());
         }
-        TunnResult::Done | TunnResult::Err(_) => {}
+        TunnResult::Done => {
+            authenticated = true;
+        }
+        TunnResult::Err(_) => {}
     }
 
-    (net_out, tun_out, session_established)
+    (net_out, tun_out, session_established, authenticated)
 }
 
 fn bind_direct_udp(

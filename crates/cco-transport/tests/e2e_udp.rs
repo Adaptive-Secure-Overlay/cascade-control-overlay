@@ -594,3 +594,153 @@ while True:
         "Python peer failed cross-compat verification: stdout={stdout:?} stderr={stderr:?}"
     );
 }
+
+#[tokio::test]
+async fn nat_roaming_allows_initiator_behind_ephemeral_port_over_4node_mcc() {
+    // Nodes X1, X2, B bind to their advertised ports; initiator A binds to an ephemeral
+    // NAT-like port that does NOT match A's stale `overlay_addr` in `peers.json`.
+    let dir = TempDir::new().unwrap();
+    let names = ["A", "X1", "X2", "B"];
+    let ports = pick_free_udp_ports(5); // ports[0] is stale/unreachable for A; ports[4] is A's real NAT port
+
+    let root_sk = Ed25519SecretKey::generate();
+    let mut signers = BTreeMap::new();
+    signers.insert("nat-root".to_owned(), root_sk.public_key());
+    let root_path = dir.path().join("root.json");
+    fs::write(&root_path, build_trust_root_bytes(&signers).unwrap()).unwrap();
+
+    let mut records = BTreeMap::new();
+    let mut secrets = BTreeMap::new();
+    let mut peers = BTreeMap::new();
+    for (idx, &name) in names.iter().enumerate() {
+        let esk = Ed25519SecretKey::generate();
+        let xsk = X25519SecretKey::generate();
+        records.insert(
+            name.to_owned(),
+            NodeKeyRecord {
+                encryption: xsk.public_key(),
+                verification: esk.public_key(),
+                key_id: esk.public_key().key_id(),
+                revoked: false,
+            },
+        );
+        secrets.insert(name, (esk, xsk));
+        peers.insert(
+            name.to_owned(),
+            PeerEndpoint {
+                name: name.to_owned(),
+                overlay_addr: SocketAddr::from(([127, 0, 0, 1], ports[idx])),
+                underlay_ip: Ipv4Addr::new(198, 51, 100, 10 + idx as u8),
+            },
+        );
+    }
+    let reg_bytes = sign_registry_v2(1, &records, "nat-root", &root_sk).unwrap();
+    let reg =
+        verify_registry_bytes(&reg_bytes, &root_path, names, VerifyConstraints::default()).unwrap();
+
+    let delivered: DeliveredLog = Arc::new(StdMutex::new(Vec::new()));
+    let notify = Arc::new(Notify::new());
+    let b_slot: Arc<StdMutex<Option<OverlayNodeHandle>>> = Arc::new(StdMutex::new(None));
+    let mut handles = BTreeMap::new();
+
+    for &name in &names {
+        let (esk, xsk) = secrets.remove(name).unwrap();
+        let now_s = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64;
+        let sec = EndpointSecurity::new(
+            name,
+            reg.clone(),
+            esk,
+            xsk,
+            dir.path().join(format!("{name}.sqlite")),
+            now_s,
+        )
+        .unwrap();
+
+        let bind_addr = if name == "A" {
+            // Simulate A behind NAT with a different source UDP port than configured in peers.json!
+            SocketAddr::from(([127, 0, 0, 1], ports[4]))
+        } else {
+            peers[name].overlay_addr
+        };
+        let mut cfg = NodeTransportConfig::new(name, bind_addr, peers.clone());
+        cfg.preconnect = false;
+        cfg.fanout = MccFanout {
+            x1: 2,
+            x2: 2,
+            ike: 1,
+        };
+        cfg.policy = SelectionPolicy::default();
+
+        let sink: Arc<dyn IkeSink> = match name {
+            "A" => Arc::new(RecordingAutoReplySink {
+                node_name: "A".to_owned(),
+                delivered: Arc::clone(&delivered),
+                notify: Arc::clone(&notify),
+                handle_slot: Arc::new(StdMutex::new(None)),
+                auto_reply: false,
+            }),
+            "B" => Arc::new(RecordingAutoReplySink {
+                node_name: "B".to_owned(),
+                delivered: Arc::clone(&delivered),
+                notify: Arc::clone(&notify),
+                handle_slot: Arc::clone(&b_slot),
+                auto_reply: true,
+            }),
+            _ => Arc::new(cco_transport::RelayOnlySink),
+        };
+
+        let h = OverlayNode::start(cfg, sec, sink).await.unwrap();
+        if name == "B" {
+            *b_slot.lock().unwrap() = Some(h.clone());
+        }
+        handles.insert(name, h);
+    }
+
+    let spi = [0xAA, 0xBB, 0xCC, 0xDD, 0x11, 0x22, 0x33, 0x44];
+    let init_req = build_ikev2(500, IKE_SA_INIT, 0, false, spi, b"nat-init");
+    handles["A"]
+        .send_local_ike("B", init_req, 500)
+        .await
+        .unwrap();
+
+    // Wait for B -> X2 -> X1 -> A reply over A's learned NAT endpoint!
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(6);
+    while delivered.lock().unwrap().len() < 2 {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "timed out waiting for NAT-roamed IKE_SA_INIT roundtrip; got {:?}",
+            delivered.lock().unwrap().len()
+        );
+        let _ = tokio::time::timeout(Duration::from_millis(100), notify.notified()).await;
+    }
+
+    let auth_req = build_ikev2(4500, IKE_AUTH, 1, false, spi, b"nat-auth");
+    handles["A"]
+        .send_local_ike("B", auth_req, 4500)
+        .await
+        .unwrap();
+
+    let deadline2 = tokio::time::Instant::now() + Duration::from_secs(6);
+    while delivered.lock().unwrap().len() < 4 {
+        assert!(
+            tokio::time::Instant::now() < deadline2,
+            "timed out waiting for NAT-roamed IKE_AUTH roundtrip; got {:?}",
+            delivered.lock().unwrap().len()
+        );
+        let _ = tokio::time::timeout(Duration::from_millis(100), notify.notified()).await;
+    }
+
+    let log = delivered.lock().unwrap().clone();
+    assert_eq!(log.len(), 4);
+    assert_eq!(log[0].0, "B");
+    assert_eq!(log[1].0, "A");
+    assert_eq!(log[2].0, "B");
+    assert_eq!(log[3].0, "A");
+
+    for h in handles.values() {
+        h.shutdown().await;
+    }
+}

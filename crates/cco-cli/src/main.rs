@@ -105,6 +105,9 @@ enum Commands {
         capture_base_4500: u16,
         #[arg(long, default_value_t = DEFAULT_SOCKET_MARK)]
         mark: u32,
+        /// Optional local container/NAT IPv4 address for XFRM bypass rules (defaults to peer underlay_ip).
+        #[arg(long)]
+        ike_local_ip: Option<std::net::Ipv4Addr>,
     },
 }
 
@@ -197,6 +200,10 @@ struct NodeArgs {
 
     #[arg(long, default_value_t = DEFAULT_SOCKET_MARK)]
     ike_mark: u32,
+
+    /// Optional local container/NAT IPv4 address where strongSwan charon listens (defaults to underlay_ip).
+    #[arg(long)]
+    ike_local_ip: Option<std::net::Ipv4Addr>,
 
     /// Allow non-POSIX private key files for local test fixtures (Windows).
     #[arg(long)]
@@ -457,6 +464,7 @@ async fn run(cli: Cli) -> Result<(), String> {
             capture_base_500,
             capture_base_4500,
             mark,
+            ike_local_ip,
         } => run_render_firewall(
             &name,
             &peers,
@@ -465,6 +473,7 @@ async fn run(cli: Cli) -> Result<(), String> {
             capture_base_500,
             capture_base_4500,
             mark,
+            ike_local_ip,
         ),
     }
 }
@@ -546,7 +555,7 @@ async fn run_node(args: NodeArgs) -> Result<(), String> {
     cfg.preconnect = !args.no_preconnect;
 
     let (sink, maybe_proxy): (Arc<dyn IkeSink>, Option<Arc<LinuxIkeProxy>>) = if args.ike_proxy {
-        let proxy_cfg = IkeProxyConfig::from_peers(
+        let mut proxy_cfg = IkeProxyConfig::from_peers(
             &args.name,
             peer_ips,
             args.ike_capture_base_500,
@@ -554,6 +563,9 @@ async fn run_node(args: NodeArgs) -> Result<(), String> {
             args.ike_mark,
         )
         .map_err(|e| e.to_string())?;
+        if let Some(local_ip) = args.ike_local_ip {
+            proxy_cfg.local_ip = local_ip;
+        }
         let proxy = Arc::new(LinuxIkeProxy::new(proxy_cfg));
         let sink_arc: Arc<dyn IkeSink> = proxy.clone();
         (sink_arc, Some(proxy))
@@ -587,6 +599,7 @@ async fn run_node(args: NodeArgs) -> Result<(), String> {
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 fn run_render_firewall(
     name: &str,
     peers_path: &Path,
@@ -595,6 +608,7 @@ fn run_render_firewall(
     base_500: u16,
     base_4500: u16,
     mark: u32,
+    ike_local_ip: Option<std::net::Ipv4Addr>,
 ) -> Result<(), String> {
     let raw = fs::read(peers_path).map_err(|_| "peers_file_unavailable".to_owned())?;
     let peer_list: Vec<PeerEndpoint> =
@@ -603,8 +617,11 @@ fn run_render_firewall(
         .into_iter()
         .map(|p| (p.name, p.underlay_ip))
         .collect();
-    let cfg = IkeProxyConfig::from_peers(name, peer_ips, base_500, base_4500, mark)
+    let mut cfg = IkeProxyConfig::from_peers(name, peer_ips, base_500, base_4500, mark)
         .map_err(|e| e.to_string())?;
+    if let Some(local_ip) = ike_local_ip {
+        cfg.local_ip = local_ip;
+    }
     match kind {
         FirewallKind::Nft => print!("{}", render_nftables_rules(&cfg)),
         FirewallKind::Xfrm => print!("{}", render_xfrm_bypass_script(&cfg, overlay_port, 1)),

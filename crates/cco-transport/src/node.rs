@@ -103,6 +103,9 @@ struct SharedTransport {
     config: NodeTransportConfig,
     socket: UdpSocket,
     addr_to_peer: HashMap<SocketAddr, String>,
+    /// Live peer UDP endpoints; updated only after cryptographic MGMT/AEAD authentication
+    /// to support clients behind NAT / Docker bridge without enabling unauthenticated spoofing.
+    peer_addrs: Mutex<HashMap<String, SocketAddr>>,
 
     sessions: Mutex<HashMap<String, PeerSessionSlot>>,
     pending_resp: Mutex<HashMap<String, PendingResponderHandshake>>,
@@ -276,8 +279,10 @@ impl OverlayNode {
         let local_addr = socket.local_addr()?;
 
         let mut addr_to_peer = HashMap::new();
+        let mut peer_addrs = HashMap::new();
         for (name, ep) in &config.peers {
             addr_to_peer.insert(ep.overlay_addr, name.clone());
+            peer_addrs.insert(name.clone(), ep.overlay_addr);
         }
 
         let self_name = config.name.clone();
@@ -296,6 +301,7 @@ impl OverlayNode {
             config,
             socket,
             addr_to_peer,
+            peer_addrs: Mutex::new(peer_addrs),
             sessions: Mutex::new(HashMap::new()),
             pending_resp: Mutex::new(HashMap::new()),
             hs_init_waiters: Mutex::new(HashMap::new()),
@@ -435,26 +441,52 @@ fn now_ms() -> u64 {
         .map_or(0, |d| d.as_millis() as u64)
 }
 
-async fn send_peer_framed(
+async fn send_peer_framed_to(
     shared: &SharedTransport,
     peer: &str,
     payload: &[u8],
+    override_addr: Option<SocketAddr>,
 ) -> Result<(), TransportError> {
     if peer == shared.self_name {
         return Err(TransportError::UnknownPeer);
     }
-    let addr = shared
-        .config
-        .peers
-        .get(peer)
-        .ok_or(TransportError::UnknownPeer)?
-        .overlay_addr;
+    let addr = match override_addr {
+        Some(a) => a,
+        None => {
+            if let Some(&live) = shared.peer_addrs.lock().await.get(peer) {
+                live
+            } else {
+                shared
+                    .config
+                    .peers
+                    .get(peer)
+                    .ok_or(TransportError::UnknownPeer)?
+                    .overlay_addr
+            }
+        }
+    };
     let frames = fragment_payload(&shared.self_name, peer, payload)
         .map_err(|e| TransportError::Protocol(e.code()))?;
     for frame in frames {
         shared.socket.send_to(&frame, addr).await?;
     }
     Ok(())
+}
+
+async fn send_peer_framed(
+    shared: &SharedTransport,
+    peer: &str,
+    payload: &[u8],
+) -> Result<(), TransportError> {
+    send_peer_framed_to(shared, peer, payload, None).await
+}
+
+async fn update_authenticated_peer_addr(shared: &SharedTransport, peer: &str, src: SocketAddr) {
+    let mut map = shared.peer_addrs.lock().await;
+    if map.get(peer) != Some(&src) {
+        info!(peer, %src, "updated authenticated NAT peer endpoint");
+        map.insert(peer.to_owned(), src);
+    }
 }
 
 async fn install_peer_session(shared: &SharedTransport, peer: &str, session: MgmtSession) {
@@ -702,11 +734,20 @@ async fn dispatch_actions(shared: Arc<SharedTransport>, actions: Vec<MccAction>)
 }
 
 async fn handle_udp_packet(shared: Arc<SharedTransport>, data: Vec<u8>, src: SocketAddr) {
-    let Some(peer) = shared.addr_to_peer.get(&src).cloned() else {
-        debug!(%src, "dropping packet from unknown udp peer");
+    let Ok(val) = jload(&data) else {
         return;
     };
-    let Ok(val) = jload(&data) else {
+    let peer = if let Some(p) = shared.addr_to_peer.get(&src) {
+        p.clone()
+    } else if let Some(from) = val.get("from").and_then(Value::as_str) {
+        if from != shared.self_name && shared.config.peers.contains_key(from) {
+            from.to_owned()
+        } else {
+            debug!(%src, from, "dropping packet from unknown udp peer");
+            return;
+        }
+    } else {
+        debug!(%src, "dropping packet from unknown udp peer");
         return;
     };
     let Some(t_str) = val.get("t").and_then(Value::as_str) else {
@@ -739,7 +780,7 @@ async fn handle_udp_packet(shared: Arc<SharedTransport>, data: Vec<u8>, src: Soc
                     responder_handle_init(&shared.self_name, &peer, &init)
                 {
                     shared.pending_resp.lock().await.insert(sid, pending);
-                    let _ = send_peer_framed(&shared, &peer, &resp_wire).await;
+                    let _ = send_peer_framed_to(&shared, &peer, &resp_wire, Some(src)).await;
                 }
             }
         }
@@ -756,15 +797,18 @@ async fn handle_udp_packet(shared: Arc<SharedTransport>, data: Vec<u8>, src: Soc
                 if let Some(pending) = maybe_pending {
                     match responder_handle_auth(&shared.self_name, &peer, pending, &auth) {
                         Ok((session, resp_wire)) => {
+                            update_authenticated_peer_addr(&shared, &peer, src).await;
                             install_peer_session(&shared, &peer, session).await;
-                            let _ = send_peer_framed(&shared, &peer, &resp_wire).await;
+                            let _ =
+                                send_peer_framed_to(&shared, &peer, &resp_wire, Some(src)).await;
                             flush_pending_sends(Arc::clone(&shared), &peer).await;
                         }
                         Err(_) => {
                             if let Ok(err_wire) =
                                 jdump(&ErrorEnvelope::new("AUTH_FAIL", "mgmt auth failed", None))
                             {
-                                let _ = send_peer_framed(&shared, &peer, &err_wire).await;
+                                let _ =
+                                    send_peer_framed_to(&shared, &peer, &err_wire, Some(src)).await;
                             }
                         }
                     }
@@ -777,6 +821,7 @@ async fn handle_udp_packet(shared: Arc<SharedTransport>, data: Vec<u8>, src: Soc
                 if let Some((hs, kd, done_tx)) = maybe_pending {
                     match hs.finish_auth_resp(&shared.self_name, kd, &resp2) {
                         Ok(session) => {
+                            update_authenticated_peer_addr(&shared, &peer, src).await;
                             install_peer_session(&shared, &peer, session).await;
                             let _ = done_tx.send(true);
                             flush_pending_sends(Arc::clone(&shared), &peer).await;
@@ -817,6 +862,7 @@ async fn handle_udp_packet(shared: Arc<SharedTransport>, data: Vec<u8>, src: Soc
                     }
                 }
             };
+            update_authenticated_peer_addr(&shared, &peer, src).await;
             let actions = shared
                 .machine
                 .lock()

@@ -86,7 +86,8 @@ pub fn render_nftables_rules(config: &IkeProxyConfig) -> String {
     out.push_str("sysctl -w net.ipv4.ip_nonlocal_bind=1 >/dev/null || true\n");
     out.push_str("sysctl -w net.ipv4.conf.all.accept_local=1 >/dev/null || true\n");
     out.push_str("sysctl -w net.ipv4.conf.all.rp_filter=0 >/dev/null || true\n");
-    out.push_str("sysctl -w net.ipv4.conf.default.rp_filter=0 >/dev/null || true\n\n");
+    out.push_str("sysctl -w net.ipv4.conf.default.rp_filter=0 >/dev/null || true\n");
+    out.push_str("for f in /proc/sys/net/ipv4/conf/*/rp_filter; do echo 0 > \"$f\" 2>/dev/null || true; done\n\n");
     out.push_str(
         "nft list table inet ikeproxy >/dev/null 2>&1 && nft delete table inet ikeproxy\n",
     );
