@@ -38,15 +38,16 @@ Already reproduced in automated CI (`netns-l3-live` and `wg-userspace-l3-live`):
 | Kernel IPsec (`strongSwan 5.9.5` + `cco node`) | IKEv2 UDP/500 & 4500 via MCC `A -> X1 -> X2 -> B` | **`0`** | Direct kernel XFRM ESP (`proto 50`) | `0.101 ms` (`0%` loss) | `< 150 ms` | Linux `CAP_NET_ADMIN` + `nftables` |
 | Userspace WG (`boringtun 0.7.1` + `cco wg-tunnel`) | WG Type 1/2/3 via MCC `A -> X1 -> X2 -> B` | **`0`** | Direct userspace WG Type 4 UDP | `0.452 ms` (`0%` loss) | `105 ms` | Rootless Android `VpnService` / signed `Wintun` / macOS `utun` |
 
-### Completed Geo-Distributed 4-Node WAN Measurements (Dual NAT, `BENCHMARKS.md §6`)
+### Completed Geo-Distributed 4-Node WAN Measurements (Full 2×2 Matrix, Dual NAT, `BENCHMARKS.md §6`)
 
 Executed across 4 real WAN hosts (`Node A [Home NAT] -> Node X1 [City-1] -> Node X2 [City-2] -> Node B [City-3 NAT]`):
 
-| Architecture (Live 4-Node WAN) | Cold / Warm Handshake | Peak Daemon RAM (`VmHWM`) | Direct Control Leakage | Avg Tunnel RTT | `iperf3` 4-Stream TCP (`A->B` / `B->A`) | Seamless Rekey (`0%` Ping Loss) |
+| Architecture (Live 4-Node WAN 2×2 Matrix) | Cold / Warm Handshake | Peak Daemon RAM (`VmHWM`) | Direct Control Leakage | Avg Tunnel RTT | `iperf3` 4-Stream TCP (`A->B` / `B->A`) | Seamless Rekey (`0%` Ping Loss) |
 | :--- | :---: | :---: | :---: | :---: | :---: | :---: |
-| Python Reference + Kernel IPsec (`CPython 3.14.10` + `strongSwan 6.0.1`) | `36,110 ms` (`PRECONNECT=0`) / `247.5 ms` warm (3-hop) | `41.1–43.1 MB` (+`charon`) | **`0`** (`500`/`4500` Non-ESP) | `23.94 ms` | `71.0` / `87.3 Mbps` (receiver) | `CHILD_SA 132 ms`, `IKE_SA 88 ms` (`40/40`, `0` direct IKE) |
-| Rust `cco` + Kernel IPsec (`strongSwan 5.9.8` + `cco --ike-proxy`) | **`529.0 ms`** cold / `316–336 ms` warm (4-hop) | **`8.46–10.33 MB`** (+`charon`) | **`0`** (`500`/`4500` Non-ESP) | `24.46 ms` | `69.2` / `86.6 Mbps` (receiver) | `CHILD_SA 204–275 ms`, `IKE_SA 112–258 ms` (`40/40`, `0` direct IKE) |
-| 100% Rust Userspace WG (`boringtun 0.7.1` + `cco wg-tunnel`) | **`128.0 ms`** (1-RTT, 4-hop) | **`2.57–4.94 MiB`** total (no `charon`) | **`0`** (`Type 1/2/3`) | `25.45 ms` | **`70.3`** / `86.0 Mbps` (receiver) | Auto `120 s` PFS rekey (`62/62`, `0` direct WG ctrl) |
+| Python + Kernel IPsec (`CPython 3.14.10` + `strongSwan 6.0.1`) | `36,110 ms` (`PRECONNECT=0`) / `247.5 ms` warm (3-hop) | `41.1–43.1 MB` (+`charon`) | **`0`** (`500`/`4500` Non-ESP) | `23.94 ms` | `71.0` / `87.3 Mbps` (receiver) | `CHILD 132 ms`, `IKE 88 ms` (`40/40`, `0` direct IKE) |
+| Python + Kernel WG (`CPython 3.14.10` + Linux `wg0`) | Needs `PRECONNECT=1` / `~146 ms` warm (`167 ms` + ICMP) | `41.7–42.4 MB` | **`0`** (`Type 1/2/3`) | **`21.03 ms`** | **`71.9`** / **`88.0 Mbps`** (receiver) | Auto `121 s` PFS rekey (`75/75`, `0` direct WG ctrl) |
+| Rust + Kernel IPsec (`cco` + `strongSwan 5.9.8`) | **`529.0 ms`** cold / `316–336 ms` warm (4-hop) | **`8.46–10.33 MB`** (+`charon`) | **`0`** (`500`/`4500` Non-ESP) | `24.46 ms` | `69.2` / `86.6 Mbps` (receiver) | `CHILD 204–275 ms`, `IKE 112–258 ms` (`40/40`, `0` direct IKE) |
+| 100% Rust Userspace WG (`boringtun 0.7.1` + `cco wg-tunnel`) | **`128.0 ms`** (1-RTT, 4-hop, no preconnect) | **`2.57–4.94 MiB`** total (no `charon`) | **`0`** (`Type 1/2/3`) | `25.45 ms` | `70.3` / `86.0 Mbps` (receiver, `97.8%` of `wg0`) | Auto `120 s` PFS rekey (`62/62`, `0` direct WG ctrl) |
 
 ## Artifact Archival Checklist for Paper Submission
 
