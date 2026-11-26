@@ -166,6 +166,12 @@ impl SplitTunnelHandle {
         self.overlay_handle.local_addr()
     }
 
+    /// Borrows the underlying overlay transport handle (for traffic counters & cascade inspection).
+    #[must_use]
+    pub const fn overlay_handle(&self) -> &OverlayNodeHandle {
+        &self.overlay_handle
+    }
+
     /// Returns a snapshot of live tunnel telemetry and proof counters.
     #[must_use]
     pub fn stats(&self) -> TunnelStats {
@@ -254,8 +260,16 @@ impl SplitWireGuardTunnel {
         )?;
         let direct_local_addr = direct_socket.local_addr()?;
 
+        let route_hops = match config.overlay.route_mode {
+            cco_transport::RouteMode::Mcc2 => 2u8,
+            cco_transport::RouteMode::Cascade => config.overlay.cascade.hops.min(255) as u8,
+        };
         let telemetry = TelemetryStore::new(
             config.overlay.policy.mode.as_str().to_owned(),
+            config.overlay.route_mode.as_str().to_owned(),
+            config.overlay.cascade.hop_model.as_str().to_owned(),
+            route_hops,
+            config.overlay.cascade.parallel_chains,
             config.trust_registry_version,
             config.trust_registry_sha256,
         );

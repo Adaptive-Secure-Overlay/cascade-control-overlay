@@ -1,29 +1,34 @@
 #![forbid(unsafe_code)]
 //! Asynchronous Tokio UDP overlay node with non-blocking MGMT session worker,
-//! `LINK_FRAG` framing, and fail-closed `EndpointSecurity` trust gate.
+//! `LINK_FRAG` framing, fail-closed `EndpointSecurity` trust gate, and dual
+//! control-plane routing (`mcc2` 2-hop MCC and arbitrary H-hop `UniversalCascade`).
 
 use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::net::SocketAddr;
 use std::str::FromStr;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use cco_cascade::mcc::{
-    EndpointSecurity, IkeInjectionOutcome, LocalDeliveryProof, MccAction, MccNodeConfig,
-    MccNodeMachine, WG_OVERLAY_CONTROL_PORT,
+    DeliveredIkeMeta, EndpointSecurity, IkeInjectionOutcome, LocalDeliveryProof, MccAction,
+    MccNodeConfig, MccNodeMachine, WG_OVERLAY_CONTROL_PORT,
 };
-use cco_crypto::Key256;
+use cco_cascade::universal::{CascadeAction, CascadeCounts, RelayKnowledge, UniversalCascade};
+use cco_crypto::{Key256, sha256_hex};
 use cco_proto::{
-    ErrorEnvelope, LinkFragFrame, LinkFragReassembler, MessageType, MgmtAuth, MgmtInit,
-    MgmtInitResp, SecureEnvelope, T_ERROR, T_LINK_FRAG, T_MGMT_AUTH, T_MGMT_AUTH_RESP, T_MGMT_INIT,
-    T_MGMT_INIT_RESP, fragment_payload, jdump, jload,
+    ErrorEnvelope, IKE_SA_INIT, LinkFragFrame, LinkFragReassembler, MessageType, MgmtAuth,
+    MgmtInit, MgmtInitResp, SecureEnvelope, T_ERROR, T_LINK_FRAG, T_MGMT_AUTH, T_MGMT_AUTH_RESP,
+    T_MGMT_INIT, T_MGMT_INIT_RESP, WireGuardMessageType, fragment_payload, jdump, jload,
+    parse_ikev2_packet, parse_wireguard_packet_rfc,
 };
-use serde_json::Value;
+use serde::{Deserialize, Serialize};
+use serde_json::{Map, Value, json};
 use tokio::net::UdpSocket;
 use tokio::sync::{Mutex, Notify, mpsc, oneshot};
 use tracing::{debug, info, warn};
 
-use crate::config::NodeTransportConfig;
+use crate::config::{NodeTransportConfig, RouteMode};
 use crate::error::TransportError;
 use crate::mgmt::{
     InitiatorHandshake, MgmtSession, PendingResponderHandshake, decrypt_link_envelope,
@@ -34,6 +39,46 @@ const MAX_PENDING_PER_PEER: usize = 512;
 
 type PendingSendMap = HashMap<String, VecDeque<(MessageType, Vec<u8>)>>;
 type PendingInitAuth = (InitiatorHandshake, Key256, oneshot::Sender<bool>);
+
+/// Live UDP and overlay protocol traffic counters for telemetry and benchmarks.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TransportCounters {
+    pub udp_packets_tx: u64,
+    pub udp_packets_rx: u64,
+    pub udp_bytes_tx: u64,
+    pub udp_bytes_rx: u64,
+    pub cascade_msgs_tx: u64,
+    pub cascade_msgs_rx: u64,
+    pub mcc_msgs_tx: u64,
+    pub mcc_msgs_rx: u64,
+}
+
+#[derive(Default)]
+struct AtomicCounters {
+    udp_packets_tx: AtomicU64,
+    udp_packets_rx: AtomicU64,
+    udp_bytes_tx: AtomicU64,
+    udp_bytes_rx: AtomicU64,
+    cascade_msgs_tx: AtomicU64,
+    cascade_msgs_rx: AtomicU64,
+    mcc_msgs_tx: AtomicU64,
+    mcc_msgs_rx: AtomicU64,
+}
+
+impl AtomicCounters {
+    fn snapshot(&self) -> TransportCounters {
+        TransportCounters {
+            udp_packets_tx: self.udp_packets_tx.load(Ordering::Relaxed),
+            udp_packets_rx: self.udp_packets_rx.load(Ordering::Relaxed),
+            udp_bytes_tx: self.udp_bytes_tx.load(Ordering::Relaxed),
+            udp_bytes_rx: self.udp_bytes_rx.load(Ordering::Relaxed),
+            cascade_msgs_tx: self.cascade_msgs_tx.load(Ordering::Relaxed),
+            cascade_msgs_rx: self.cascade_msgs_rx.load(Ordering::Relaxed),
+            mcc_msgs_tx: self.mcc_msgs_tx.load(Ordering::Relaxed),
+            mcc_msgs_rx: self.mcc_msgs_rx.load(Ordering::Relaxed),
+        }
+    }
+}
 
 /// Per-peer MGMT session slot retaining one previous session during rekey / crossing-init overlap.
 struct PeerSessionSlot {
@@ -75,7 +120,8 @@ impl PeerSessionSlot {
     }
 }
 
-/// Local IKE injection boundary invoked when `MccNodeMachine` emits a single-use [`LocalDeliveryProof`].
+/// Local IKE/WG control injection boundary invoked when `MccNodeMachine` or `UniversalCascade`
+/// emits a single-use [`LocalDeliveryProof`].
 pub trait IkeSink: Send + Sync + 'static {
     /// Consumes the move-only proof and performs local delivery (e.g. via `cco-linux-proxy` or test sink).
     fn deliver(
@@ -115,7 +161,9 @@ struct SharedTransport {
     pending_sends: Mutex<PendingSendMap>,
     reassembler: Mutex<LinkFragReassembler>,
     machine: Mutex<MccNodeMachine>,
+    cascade: Mutex<UniversalCascade>,
     sink: Arc<dyn IkeSink>,
+    counters: AtomicCounters,
 }
 
 enum ControlCommand {
@@ -159,6 +207,12 @@ impl OverlayNodeHandle {
         &self.shared.self_name
     }
 
+    /// Returns live atomic UDP and overlay message counters.
+    #[must_use]
+    pub fn counters(&self) -> TransportCounters {
+        self.shared.counters.snapshot()
+    }
+
     /// Explicitly establishes (or awaits) the 4-step MGMT session with `peer`.
     pub async fn ensure_session(&self, peer: &str) -> Result<(), TransportError> {
         let (tx, rx) = oneshot::channel();
@@ -172,7 +226,8 @@ impl OverlayNodeHandle {
         rx.await.map_err(|_| TransportError::NodeStopped)?
     }
 
-    /// Submits a local IKEv2 datagram (request or response) into the MCC overlay.
+    /// Submits a local IKEv2 datagram (request or response) into the configured overlay
+    /// (`mcc2` or `cascade` H-hop engine).
     pub async fn send_local_ike(
         &self,
         dst_user: &str,
@@ -192,8 +247,8 @@ impl OverlayNodeHandle {
         rx.await.map_err(|_| TransportError::NodeStopped)?
     }
 
-    /// Submits a local WireGuard control-plane handshake (`type 1/2/3` ONLY) into the MCC overlay.
-    /// WireGuard `type 4` transport packets are rejected fail-closed.
+    /// Submits a local WireGuard control-plane handshake (`type 1/2/3` ONLY) into the overlay.
+    /// WireGuard `type 4` transport packets are rejected fail-closed in both `mcc2` and `cascade`.
     pub async fn send_local_wg_handshake(
         &self,
         dst_user: &str,
@@ -228,7 +283,7 @@ impl OverlayNodeHandle {
         self.shared.sessions.lock().await.contains_key(peer)
     }
 
-    /// Returns initiator route summary `(x1, opaque_token, context)` for `(dst, spi)`, if ready.
+    /// Returns initiator route summary `(x1, opaque_token, context)` for `(dst, spi)`, if ready (`mcc2`).
     pub async fn initiator_route_summary(
         &self,
         dst: &str,
@@ -239,6 +294,43 @@ impl OverlayNodeHandle {
             .lock()
             .await
             .initiator_route_summary(dst, initiator_spi)
+    }
+
+    /// Returns active `UniversalCascade` state counts on this node.
+    pub async fn cascade_counts(&self) -> CascadeCounts {
+        self.shared.cascade.lock().await.local_counts(now_secs())
+    }
+
+    /// Returns role-limited relay knowledge visible to this node in `UniversalCascade`.
+    pub async fn cascade_relay_knowledge(&self) -> Vec<RelayKnowledge> {
+        self.shared.cascade.lock().await.relay_knowledge(now_secs())
+    }
+
+    /// Returns full diagnostic relay memory dump for negative leakage tests.
+    pub async fn cascade_memory_debug(&self) -> Value {
+        self.shared
+            .cascade
+            .lock()
+            .await
+            .inspect_relay_memory_debug()
+    }
+
+    /// Returns first hop `X1` known to initiator `A` for `dst` (`X2..Xm` remain unknown).
+    pub async fn cascade_first_hop(&self, dst: &str) -> Option<String> {
+        self.shared.cascade.lock().await.source_first_hop(dst)
+    }
+
+    /// Returns last hop `Xm` known to destination `B` for `src` (`X1..X(m-1)` remain unknown).
+    pub async fn cascade_last_hop(&self, src: &str) -> Option<String> {
+        self.shared.cascade.lock().await.endpoint_last_hop(src)
+    }
+
+    /// Closes an active source cascade route to `dst` (for multi-trial benchmarks and cleanup).
+    pub async fn close_cascade_route(&self, dst: &str) {
+        let actions = self.shared.cascade.lock().await.close_source_route(dst);
+        if !actions.is_empty() {
+            dispatch_cascade_actions(Arc::clone(&self.shared), actions).await;
+        }
     }
 
     /// Cleanly shuts down the overlay node tasks.
@@ -260,11 +352,38 @@ impl OverlayNode {
         security: EndpointSecurity,
         sink: Arc<dyn IkeSink>,
     ) -> Result<OverlayNodeHandle, TransportError> {
+        if config.route_mode == RouteMode::Cascade {
+            if config.cascade.hops < 2 || config.cascade.hops > config.cascade.max_hops {
+                return Err(TransportError::Cascade("invalid_hop_count"));
+            }
+            if config.cascade.parallel_chains == 0
+                || config.cascade.parallel_chains > cco_cascade::universal::MAX_PARALLEL_CHAINS
+            {
+                return Err(TransportError::Cascade("invalid_parallel_chains"));
+            }
+        }
+
         let peer_ips: BTreeMap<String, std::net::Ipv4Addr> = config
             .peers
             .iter()
             .map(|(k, v)| (k.clone(), v.underlay_ip))
             .collect();
+        let members: Vec<String> = config.peers.keys().cloned().collect();
+
+        // Build authenticated UniversalCascade identity (X25519 + Ed25519) before moving `security`.
+        let cascade_id = security
+            .build_cascade_identity()
+            .map_err(|e| TransportError::Cascade(e.code()))?;
+        let cascade = UniversalCascade::new_with_model(
+            cascade_id,
+            members,
+            config.cascade.max_hops.max(config.cascade.hops).max(2),
+            config.cascade.route_ttl_secs,
+            config.cascade.hop_model,
+            None,
+        )
+        .map_err(|e| TransportError::Cascade(e.code()))?;
+
         let mcc_cfg = MccNodeConfig {
             peers: peer_ips,
             fanout: config.fanout,
@@ -274,7 +393,7 @@ impl OverlayNode {
         let machine = MccNodeMachine::new(security, mcc_cfg)
             .map_err(|e| TransportError::Cascade(e.code()))?;
 
-        // Bind UDP socket ONLY after Trust Registry v2 + EndpointSecurity + MccNodeMachine succeeded!
+        // Bind UDP socket ONLY after Trust Registry v2 + EndpointSecurity + state machines succeeded!
         let socket = bind_sized_udp_socket(config.bind_addr, config.socket_protector.as_deref())?;
         let local_addr = socket.local_addr()?;
 
@@ -287,8 +406,6 @@ impl OverlayNode {
 
         let self_name = config.name.clone();
         let preconnect = config.preconnect;
-        // Deterministic initiator tie-breaking (self < peer) avoids simultaneous
-        // crossing MGMT handshakes overwriting each other's session IDs.
         let preconnect_peers: Vec<String> = config
             .peers
             .keys()
@@ -310,7 +427,9 @@ impl OverlayNode {
             pending_sends: Mutex::new(HashMap::new()),
             reassembler: Mutex::new(LinkFragReassembler::new(self_name)),
             machine: Mutex::new(machine),
+            cascade: Mutex::new(cascade),
             sink,
+            counters: AtomicCounters::default(),
         });
 
         let (cmd_tx, mut cmd_rx) = mpsc::channel::<ControlCommand>(256);
@@ -326,12 +445,12 @@ impl OverlayNode {
                     recv_res = shared_loop.socket.recv_from(&mut buf) => {
                         match recv_res {
                             Ok((len, src)) => {
+                                shared_loop.counters.udp_packets_rx.fetch_add(1, Ordering::Relaxed);
+                                shared_loop.counters.udp_bytes_rx.fetch_add(len as u64, Ordering::Relaxed);
                                 let packet = buf[..len].to_vec();
                                 handle_udp_packet(Arc::clone(&shared_loop), packet, src).await;
                             }
                             Err(err) => {
-                                // Windows UDP sockets can surface ICMP Port Unreachable as
-                                // ConnectionReset (WSAECONNRESET 10054). Never crash the daemon.
                                 if err.kind() == std::io::ErrorKind::ConnectionReset {
                                     debug!("udp recv ignored connection reset");
                                     continue;
@@ -345,21 +464,36 @@ impl OverlayNode {
                         if !actions.is_empty() {
                             dispatch_actions(Arc::clone(&shared_loop), actions).await;
                         }
+                        shared_loop.cascade.lock().await.cleanup(now_secs());
                     }
                     cmd = cmd_rx.recv() => {
                         match cmd {
                             Some(ControlCommand::SendLocalIke { dst_user, payload, udp_port, reply }) => {
-                                let res = {
-                                    let mut m = shared_loop.machine.lock().await;
-                                    m.send_local_ike(&dst_user, &payload, udp_port, now_ms())
-                                };
-                                match res {
-                                    Ok(actions) => {
-                                        dispatch_actions(Arc::clone(&shared_loop), actions).await;
-                                        let _ = reply.send(Ok(()));
+                                match shared_loop.config.route_mode {
+                                    RouteMode::Mcc2 => {
+                                        let res = {
+                                            let mut m = shared_loop.machine.lock().await;
+                                            m.send_local_ike(&dst_user, &payload, udp_port, now_ms())
+                                        };
+                                        match res {
+                                            Ok(actions) => {
+                                                dispatch_actions(Arc::clone(&shared_loop), actions).await;
+                                                let _ = reply.send(Ok(()));
+                                            }
+                                            Err(e) => {
+                                                let _ = reply.send(Err(TransportError::Cascade(e.code())));
+                                            }
+                                        }
                                     }
-                                    Err(e) => {
-                                        let _ = reply.send(Err(TransportError::Cascade(e.code())));
+                                    RouteMode::Cascade => {
+                                        let res = send_local_via_cascade(
+                                            Arc::clone(&shared_loop),
+                                            &dst_user,
+                                            &payload,
+                                            udp_port,
+                                        )
+                                        .await;
+                                        let _ = reply.send(res);
                                     }
                                 }
                             }
@@ -395,13 +529,88 @@ impl OverlayNode {
             }
         }
 
-        info!(node = %shared.self_name, addr = %local_addr, "overlay node started");
+        info!(
+            node = %shared.self_name,
+            addr = %local_addr,
+            route_mode = shared.config.route_mode.as_str(),
+            hops = shared.config.cascade.hops,
+            hop_model = shared.config.cascade.hop_model.as_str(),
+            parallel_chains = shared.config.cascade.parallel_chains,
+            "overlay node started"
+        );
         Ok(OverlayNodeHandle {
             local_addr,
             shared,
             cmd_tx,
         })
     }
+}
+
+async fn send_local_via_cascade(
+    shared: Arc<SharedTransport>,
+    dst_user: &str,
+    payload: &[u8],
+    udp_port: u16,
+) -> Result<(), TransportError> {
+    // Fail-closed protocol gate identical to MCC: ONLY IKEv2 or WG Type 1/2/3 permitted!
+    let (is_response, is_initial_exchange) = if udp_port == WG_OVERLAY_CONTROL_PORT {
+        let parsed = parse_wireguard_packet_rfc(payload)
+            .map_err(|_| TransportError::Cascade("invalid_wg_packet"))?;
+        if !parsed.is_handshake_control() {
+            return Err(TransportError::Cascade("wg_transport_forbidden_in_overlay"));
+        }
+        (
+            parsed.message_type != WireGuardMessageType::HandshakeInitiation,
+            parsed.message_type == WireGuardMessageType::HandshakeInitiation,
+        )
+    } else {
+        let hdr = parse_ikev2_packet(udp_port, payload)
+            .map_err(|_| TransportError::Cascade("invalid_ike_packet"))?;
+        (
+            hdr.is_response(),
+            !hdr.is_response() && hdr.exchange_type == IKE_SA_INIT && hdr.message_id == 0,
+        )
+    };
+
+    let mut meta = Map::new();
+    meta.insert("udp_port".to_owned(), json!(udp_port));
+    meta.insert(
+        "proto".to_owned(),
+        json!(if udp_port == WG_OVERLAY_CONTROL_PORT {
+            "wg"
+        } else {
+            "ikev2"
+        }),
+    );
+
+    let now_s = now_secs();
+    let hops = shared.config.cascade.hops;
+    let k_chains = shared.config.cascade.parallel_chains;
+
+    let actions = {
+        let mut uc = shared.cascade.lock().await;
+        if is_response {
+            if uc.has_endpoint_route(dst_user, now_s) {
+                uc.send_reverse(dst_user, payload, meta, now_s)
+            } else if uc.has_source_route(dst_user, false, now_s) {
+                uc.send_forward(dst_user, payload, meta, now_s)
+            } else {
+                uc.start_parallel_chains(dst_user, hops, k_chains, payload, meta, now_s)
+            }
+        } else if uc.has_source_route(dst_user, false, now_s) && !is_initial_exchange {
+            uc.send_forward(dst_user, payload, meta, now_s)
+        } else if uc.has_source_route(dst_user, true, now_s) && udp_port == WG_OVERLAY_CONTROL_PORT
+        {
+            // Active route already open for WG rekey / follow-up handshake -> send forward.
+            uc.send_forward(dst_user, payload, meta, now_s)
+        } else {
+            uc.start_parallel_chains(dst_user, hops, k_chains, payload, meta, now_s)
+        }
+    }
+    .map_err(|e| TransportError::Cascade(e.code()))?;
+
+    dispatch_cascade_actions(shared, actions).await;
+    Ok(())
 }
 
 fn bind_sized_udp_socket(
@@ -413,8 +622,6 @@ fn bind_sized_udp_socket(
         SocketAddr::V6(_) => socket2::Domain::IPV6,
     };
     let sock = socket2::Socket::new(domain, socket2::Type::DGRAM, Some(socket2::Protocol::UDP))?;
-    // Size kernel UDP buffers to absorb multi-route LINK_FRAG bursts (e.g., 10-node MCC fanout)
-    // without OS-level silent packet drops (Windows defaults to 64 KiB).
     let _ = sock.set_recv_buffer_size(4 * 1024 * 1024);
     let _ = sock.set_send_buffer_size(4 * 1024 * 1024);
     sock.set_nonblocking(true)?;
@@ -439,6 +646,10 @@ fn now_ms() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map_or(0, |d| d.as_millis() as u64)
+}
+
+fn now_secs() -> f64 {
+    (now_ms() as f64) / 1000.0
 }
 
 async fn send_peer_framed_to(
@@ -469,6 +680,14 @@ async fn send_peer_framed_to(
         .map_err(|e| TransportError::Protocol(e.code()))?;
     for frame in frames {
         shared.socket.send_to(&frame, addr).await?;
+        shared
+            .counters
+            .udp_packets_tx
+            .fetch_add(1, Ordering::Relaxed);
+        shared
+            .counters
+            .udp_bytes_tx
+            .fetch_add(frame.len() as u64, Ordering::Relaxed);
     }
     Ok(())
 }
@@ -515,7 +734,6 @@ async fn ensure_session_async(
         return Ok(());
     }
 
-    // Check if another task is already negotiating with `peer`.
     let maybe_waiter = {
         let mut inflight = shared.inflight_ensure.lock().await;
         if let Some(notify) = inflight.get(peer) {
@@ -579,9 +797,6 @@ async fn ensure_session_async(
             continue;
         };
 
-        // Register initiator state BEFORE sending MGMT_AUTH so handle_udp_packet
-        // finalizes and installs the session synchronously upon MGMT_AUTH_RESP
-        // (strictly before reading the next UDP datagram from the socket).
         let (auth_done_tx, auth_done_rx) = oneshot::channel();
         shared
             .pending_init_auth
@@ -606,7 +821,6 @@ async fn ensure_session_async(
         }
     }
 
-    // Wake any tasks waiting on this session and flush queued messages!
     if let Some(notify) = shared.inflight_ensure.lock().await.remove(peer) {
         notify.notify_waiters();
     }
@@ -656,8 +870,6 @@ async fn send_link_encrypted(
     mtype: MessageType,
     payload: Vec<u8>,
 ) -> Result<(), TransportError> {
-    // Hold lock order (sessions -> pending_sends) atomically so a message can never be
-    // enqueued right after a racing session install already drained pending_sends.
     let maybe_wire = {
         let sessions = shared.sessions.lock().await;
         if let Some(slot) = sessions.get(peer) {
@@ -700,9 +912,8 @@ async fn dispatch_actions(shared: Arc<SharedTransport>, actions: Vec<MccAction>)
                 message_type,
                 payload,
             } => {
+                shared.counters.mcc_msgs_tx.fetch_add(1, Ordering::Relaxed);
                 if peer == shared.self_name {
-                    // Repeated adjacent logical role (e.g. X2 == B in F4 model):
-                    // consume locally without UDP self-send (mcc_privacy.py::_opaque_send).
                     let follow = shared.machine.lock().await.on_inbound(
                         &shared.self_name,
                         message_type,
@@ -733,6 +944,111 @@ async fn dispatch_actions(shared: Arc<SharedTransport>, actions: Vec<MccAction>)
     }
 }
 
+async fn dispatch_cascade_actions(shared: Arc<SharedTransport>, actions: Vec<CascadeAction>) {
+    let mut queue: VecDeque<CascadeAction> = actions.into_iter().collect();
+    while let Some(action) = queue.pop_front() {
+        match action {
+            CascadeAction::Send {
+                peer,
+                message_type,
+                message,
+            } => {
+                shared
+                    .counters
+                    .cascade_msgs_tx
+                    .fetch_add(1, Ordering::Relaxed);
+                let Ok(bytes) = jdump(&message) else {
+                    continue;
+                };
+                if let Err(err) =
+                    send_link_encrypted(Arc::clone(&shared), &peer, message_type, bytes).await
+                {
+                    warn!(peer, error = %err, "cascade overlay send failed");
+                    if let Ok(recovery) = shared.cascade.lock().await.handle_send_failure(
+                        &peer,
+                        message_type,
+                        &message,
+                        now_secs(),
+                    ) {
+                        queue.extend(recovery);
+                    }
+                }
+            }
+            CascadeAction::Deliver {
+                direction,
+                remote_peer,
+                payload,
+                metadata,
+                local_route_ref,
+            } => {
+                let udp_port = metadata
+                    .get("udp_port")
+                    .and_then(Value::as_u64)
+                    .unwrap_or(500) as u16;
+                let remote_ip = shared
+                    .config
+                    .peers
+                    .get(&remote_peer)
+                    .map(|p| p.underlay_ip.to_string())
+                    .unwrap_or_default();
+                let local_ip = shared
+                    .config
+                    .peers
+                    .get(&shared.self_name)
+                    .map(|p| p.underlay_ip.to_string())
+                    .unwrap_or_default();
+                let (x1, x2) = {
+                    let uc = shared.cascade.lock().await;
+                    if direction == "back" {
+                        (
+                            uc.source_first_hop(&remote_peer).unwrap_or_default(),
+                            String::new(),
+                        )
+                    } else {
+                        (
+                            String::new(),
+                            uc.endpoint_last_hop(&remote_peer).unwrap_or_default(),
+                        )
+                    }
+                };
+                let meta = DeliveredIkeMeta {
+                    src: remote_peer.clone(),
+                    dst: shared.self_name.clone(),
+                    x1,
+                    x2,
+                    conn_id: local_route_ref.clone(),
+                    context: local_route_ref.clone(),
+                    direction,
+                    ike_src_ip: remote_ip,
+                    ike_src_port: udp_port,
+                    ike_dst_ip: local_ip,
+                    ike_dst_port: udp_port,
+                    udp_port,
+                    opaque_token: local_route_ref.clone(),
+                    expected_copies: shared.config.cascade.parallel_chains,
+                    copy_id: 1,
+                    message_key: format!("cascade:{local_route_ref}:{}", sha256_hex(&payload)),
+                };
+                let proof = LocalDeliveryProof::mint_cascade(payload, meta);
+                let (_outcome, _receipt) = shared.sink.deliver(proof);
+            }
+            CascadeAction::RouteReady {
+                remote_peer,
+                local_route_ref,
+                hops,
+            } => {
+                info!(
+                    node = %shared.self_name,
+                    remote_peer,
+                    route_ref = %local_route_ref,
+                    hops,
+                    "universal cascade route active"
+                );
+            }
+        }
+    }
+}
+
 async fn handle_udp_packet(shared: Arc<SharedTransport>, data: Vec<u8>, src: SocketAddr) {
     let Ok(val) = jload(&data) else {
         return;
@@ -758,7 +1074,7 @@ async fn handle_udp_packet(shared: Arc<SharedTransport>, data: Vec<u8>, src: Soc
         let Ok(frame) = serde_json::from_value::<LinkFragFrame>(val) else {
             return;
         };
-        let now_s = (now_ms() as f64) / 1000.0;
+        let now_s = now_secs();
         let assembled = shared
             .reassembler
             .lock()
@@ -834,7 +1150,6 @@ async fn handle_udp_packet(shared: Arc<SharedTransport>, data: Vec<u8>, src: Soc
             }
         }
         T_ERROR => {
-            // Unauthenticated plaintext errors are ignored by the authenticated profile.
             debug!(peer, "ignoring unauthenticated plaintext error frame");
         }
         other => {
@@ -863,12 +1178,44 @@ async fn handle_udp_packet(shared: Arc<SharedTransport>, data: Vec<u8>, src: Soc
                 }
             };
             update_authenticated_peer_addr(&shared, &peer, src).await;
-            let actions = shared
-                .machine
-                .lock()
-                .await
-                .on_inbound(&peer, mtype, &plain, now_ms());
-            dispatch_actions(shared, actions).await;
+
+            if mtype.is_cascade_message() {
+                shared
+                    .counters
+                    .cascade_msgs_rx
+                    .fetch_add(1, Ordering::Relaxed);
+                let Ok(msg_val) = jload(&plain) else {
+                    return;
+                };
+                let res = {
+                    shared
+                        .cascade
+                        .lock()
+                        .await
+                        .receive(&peer, mtype, &msg_val, "", now_secs())
+                };
+                match res {
+                    Ok(actions) => dispatch_cascade_actions(shared, actions).await,
+                    Err(err) => {
+                        debug!(
+                            node = %shared.self_name,
+                            peer,
+                            msg_type = mtype.as_str(),
+                            code = err.code(),
+                            "cascade rejected message"
+                        );
+                    }
+                }
+            } else {
+                shared.counters.mcc_msgs_rx.fetch_add(1, Ordering::Relaxed);
+                let actions =
+                    shared
+                        .machine
+                        .lock()
+                        .await
+                        .on_inbound(&peer, mtype, &plain, now_ms());
+                dispatch_actions(shared, actions).await;
+            }
         }
     }
 }

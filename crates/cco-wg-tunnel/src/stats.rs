@@ -42,9 +42,18 @@ pub struct TunnelStats {
     pub direct_bytes_rx: u64,
     /// Elapsed milliseconds for the initial overlay WireGuard handshake, once established.
     pub handshake_ms: Option<u64>,
-    /// Number of hops in the MCC overlay control route (`4` for `A -> X1 -> X2 -> B`).
+    /// Number of hops in the control-plane route (`2` relays / `4` nodes in `mcc2`, or `m` in `cascade`).
     pub selected_route_hops: u8,
-    /// Selected first-hop relay `X1` (`X2` remains strictly hidden from initiator `A`).
+    /// Active routing engine (`mcc2` or `cascade`).
+    #[serde(default)]
+    pub route_mode: String,
+    /// Active cascade next-hop model (`f3` or `f4`).
+    #[serde(default)]
+    pub hop_model: String,
+    /// Parallel independent chains `K` (`O(K * m)` budget in `cascade` mode).
+    #[serde(default)]
+    pub parallel_chains: usize,
+    /// Selected first-hop relay `X1` (`X2..Xm` remain strictly hidden from initiator `A`).
     pub selected_x1: Option<String>,
     /// Active MCC branch selection mode (`first`, `window`, `adaptive`, `wait-all`).
     pub mcc_mode: String,
@@ -75,6 +84,10 @@ pub(crate) struct TelemetryStore {
 impl TelemetryStore {
     pub(crate) fn new(
         mcc_mode: String,
+        route_mode: String,
+        hop_model: String,
+        selected_route_hops: u8,
+        parallel_chains: usize,
         trust_registry_version: u64,
         trust_registry_sha256: String,
     ) -> Self {
@@ -90,7 +103,10 @@ impl TelemetryStore {
                 direct_bytes_tx: 0,
                 direct_bytes_rx: 0,
                 handshake_ms: None,
-                selected_route_hops: 4,
+                selected_route_hops,
+                route_mode,
+                hop_model,
+                parallel_chains,
                 selected_x1: None,
                 mcc_mode,
                 trust_registry_version,
