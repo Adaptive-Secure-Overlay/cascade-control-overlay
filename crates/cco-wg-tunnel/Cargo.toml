@@ -1,0 +1,26 @@
+[package]
+name = "cco-wg-tunnel"
+description = "Userspace WireGuard tunnel splitting control handshakes (type 1/2/3) through MCC overlay and data (type 4) directly"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+boringtun.workspace = true
+cco-cascade.workspace = true
+cco-crypto.workspace = true
+cco-proto.workspace = true
+cco-transport.workspace = true
+cco-trust.workspace = true
+serde.workspace = true
+socket2.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+zeroize.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

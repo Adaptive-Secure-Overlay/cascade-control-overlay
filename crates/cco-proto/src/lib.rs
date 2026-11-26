@@ -27,7 +27,7 @@ pub use link_frag::{
 pub use messages::*;
 pub use wireguard::{
     WG_COOKIE_REPLY_LEN, WG_INITIATION_LEN, WG_RESPONSE_LEN, WG_TRANSPORT_MIN_LEN,
-    WireGuardMessageType, WireGuardPacket, parse_wireguard_packet,
+    WireGuardMessageType, WireGuardPacket, parse_wireguard_packet, parse_wireguard_packet_rfc,
 };
 
 #[cfg(test)]

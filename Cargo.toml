@@ -7,6 +7,7 @@ members = [
     "crates/cco-cascade",
     "crates/cco-transport",
     "crates/cco-linux-proxy",
+    "crates/cco-wg-tunnel",
     "crates/cco-analytics",
     "crates/cco-cli",
 ]
@@ -28,10 +29,12 @@ cco-proto = { path = "crates/cco-proto" }
 cco-cascade = { path = "crates/cco-cascade" }
 cco-transport = { path = "crates/cco-transport" }
 cco-linux-proxy = { path = "crates/cco-linux-proxy" }
+cco-wg-tunnel = { path = "crates/cco-wg-tunnel" }
 cco-analytics = { path = "crates/cco-analytics" }
 
 aes-gcm = "0.10"
 base64 = "0.22"
+boringtun = "0.7"
 clap = { version = "4.5", features = ["derive"] }
 ed25519-dalek = { version = "2.1", features = ["rand_core", "zeroize"] }
 hex = "0.4"

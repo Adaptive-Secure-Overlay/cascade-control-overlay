@@ -6,7 +6,7 @@ pub mod error;
 pub mod mgmt;
 pub mod node;
 
-pub use config::{NodeTransportConfig, PeerEndpoint};
+pub use config::{NodeTransportConfig, PeerEndpoint, SocketProtector};
 pub use error::TransportError;
 pub use mgmt::{
     InitiatorHandshake, MgmtSession, PendingResponderHandshake, decrypt_link_envelope,

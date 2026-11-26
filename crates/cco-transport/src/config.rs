@@ -2,10 +2,16 @@
 //! Configuration structs for the overlay transport node.
 
 use std::collections::BTreeMap;
+use std::fmt;
 use std::net::{Ipv4Addr, SocketAddr};
+use std::sync::Arc;
 
 use cco_cascade::mcc::{MccFanout, SelectionPolicy};
 use serde::{Deserialize, Serialize};
+
+/// Optional platform callback protecting outbound UDP sockets from VPN routing loops
+/// (e.g., Android `VpnService.protect(fd)`).
+pub type SocketProtector = Arc<dyn Fn(i32) -> bool + Send + Sync>;
 
 /// Network addressing for one overlay mesh participant.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -19,7 +25,7 @@ pub struct PeerEndpoint {
 }
 
 /// Runtime configuration for one [`crate::OverlayNode`].
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct NodeTransportConfig {
     /// Local node name (must exist in `peers` and Trust Registry v2).
     pub name: String,
@@ -27,7 +33,7 @@ pub struct NodeTransportConfig {
     pub bind_addr: SocketAddr,
     /// Complete peer directory keyed by node name.
     pub peers: BTreeMap<String, PeerEndpoint>,
-    /// MCC fanout budget when initiating new IKEv2 routes.
+    /// MCC fanout budget when initiating new IKEv2 or WireGuard control routes.
     pub fanout: MccFanout,
     /// MCC receiver-side selection policy.
     pub policy: SelectionPolicy,
@@ -39,6 +45,24 @@ pub struct NodeTransportConfig {
     pub preconnect: bool,
     /// Optional deterministic seed for reproducible E2E tests.
     pub deterministic_seed: Option<u64>,
+    /// Optional socket protector callback (e.g., Android `VpnService.protect`).
+    pub socket_protector: Option<SocketProtector>,
+}
+
+impl fmt::Debug for NodeTransportConfig {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("NodeTransportConfig")
+            .field("name", &self.name)
+            .field("bind_addr", &self.bind_addr)
+            .field("peers_count", &self.peers.len())
+            .field("fanout", &self.fanout)
+            .field("policy", &self.policy)
+            .field("udp_timeout_ms", &self.udp_timeout_ms)
+            .field("retries", &self.retries)
+            .field("preconnect", &self.preconnect)
+            .field("has_socket_protector", &self.socket_protector.is_some())
+            .finish()
+    }
 }
 
 impl NodeTransportConfig {
@@ -59,6 +83,7 @@ impl NodeTransportConfig {
             retries: 4,
             preconnect: true,
             deterministic_seed: None,
+            socket_protector: None,
         }
     }
 }

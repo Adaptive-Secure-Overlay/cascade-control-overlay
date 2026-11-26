@@ -10,7 +10,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use cco_cascade::mcc::{
     EndpointSecurity, IkeInjectionOutcome, LocalDeliveryProof, MccAction, MccNodeConfig,
-    MccNodeMachine,
+    MccNodeMachine, WG_OVERLAY_CONTROL_PORT,
 };
 use cco_crypto::Key256;
 use cco_proto::{
@@ -189,6 +189,17 @@ impl OverlayNodeHandle {
         rx.await.map_err(|_| TransportError::NodeStopped)?
     }
 
+    /// Submits a local WireGuard control-plane handshake (`type 1/2/3` ONLY) into the MCC overlay.
+    /// WireGuard `type 4` transport packets are rejected fail-closed.
+    pub async fn send_local_wg_handshake(
+        &self,
+        dst_user: &str,
+        payload: Vec<u8>,
+    ) -> Result<(), TransportError> {
+        self.send_local_ike(dst_user, payload, WG_OVERLAY_CONTROL_PORT)
+            .await
+    }
+
     /// Sends a hop-encrypted frame over an established MGMT session (used in wire-compat tests).
     pub async fn send_secure_message(
         &self,
@@ -261,7 +272,7 @@ impl OverlayNode {
             .map_err(|e| TransportError::Cascade(e.code()))?;
 
         // Bind UDP socket ONLY after Trust Registry v2 + EndpointSecurity + MccNodeMachine succeeded!
-        let socket = bind_sized_udp_socket(config.bind_addr)?;
+        let socket = bind_sized_udp_socket(config.bind_addr, config.socket_protector.as_deref())?;
         let local_addr = socket.local_addr()?;
 
         let mut addr_to_peer = HashMap::new();
@@ -387,7 +398,10 @@ impl OverlayNode {
     }
 }
 
-fn bind_sized_udp_socket(addr: SocketAddr) -> Result<UdpSocket, TransportError> {
+fn bind_sized_udp_socket(
+    addr: SocketAddr,
+    protector: Option<&(dyn Fn(i32) -> bool + Send + Sync)>,
+) -> Result<UdpSocket, TransportError> {
     let domain = match addr {
         SocketAddr::V4(_) => socket2::Domain::IPV4,
         SocketAddr::V6(_) => socket2::Domain::IPV6,
@@ -398,6 +412,18 @@ fn bind_sized_udp_socket(addr: SocketAddr) -> Result<UdpSocket, TransportError> 
     let _ = sock.set_recv_buffer_size(4 * 1024 * 1024);
     let _ = sock.set_send_buffer_size(4 * 1024 * 1024);
     sock.set_nonblocking(true)?;
+    #[cfg(unix)]
+    if let Some(protect_fn) = protector {
+        use std::os::fd::AsRawFd;
+        if !protect_fn(sock.as_raw_fd()) {
+            return Err(TransportError::Io(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "vpn_socket_protect_failed",
+            )));
+        }
+    }
+    #[cfg(not(unix))]
+    let _ = protector;
     sock.bind(&addr.into())?;
     let std_sock: std::net::UdpSocket = sock.into();
     Ok(UdpSocket::from_std(std_sock)?)

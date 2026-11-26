@@ -13,8 +13,8 @@ use cco_crypto::{
     mcc_a_b_fwd_aad, priv_b_a_aad, random_bytes, sha256_hex,
 };
 use cco_proto::{
-    CanonicalValue, MessageType, canonical_bytes_from_value, jdump, jload, parse_ikev2_packet,
-    parse_strict_json_object,
+    CanonicalValue, MessageType, WireGuardMessageType, canonical_bytes_from_value, jdump, jload,
+    parse_ikev2_packet, parse_strict_json_object, parse_wireguard_packet_rfc,
 };
 use rand::Rng;
 use serde::{Deserialize, Serialize};
@@ -47,6 +47,10 @@ pub const MAX_PLAINTEXT: usize = 65_507;
 
 /// Route TTL in milliseconds (`120s`).
 pub const ROUTE_TTL_MS: u64 = 120_000;
+
+/// Canonical UDP port marker for WireGuard control-plane handshakes (`type 1/2/3`)
+/// transported through the authenticated MCC overlay (`type 4` is strictly forbidden).
+pub const WG_OVERLAY_CONTROL_PORT: u16 = 51820;
 
 /// Fanout budget `(x1_fanout, x2_fanout, ike_fanout)` for MCC cascade start copies.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -460,11 +464,10 @@ impl MccNodeMachine {
         if payload.len() < 28 || payload.len() > MAX_IKE {
             return Err(CascadeError::new("ike_size_limit"));
         }
-        let hdr = parse_ikev2_packet(udp_port, payload)
-            .map_err(|_| CascadeError::new("invalid_ike_message_binding"))?;
-        let msg_id = format!("{}:{}", hdr.exchange_type, hdr.message_id);
+        let hdr = parse_control_handshake(udp_port, payload)?;
+        let msg_id = hdr.msg_id_str;
 
-        if hdr.is_response() {
+        if hdr.is_response {
             return self.send_local_response(
                 dst_user,
                 payload,
@@ -1288,7 +1291,7 @@ impl MccNodeMachine {
                     code: "key_agreement_failed",
                 }];
             };
-            let Ok(hdr) = parse_ikev2_packet(offer.udp_port, &offer.payload) else {
+            let Ok(hdr) = parse_control_handshake(offer.udp_port, &offer.payload) else {
                 let _ = self.security.failed_delivery(&offer.verified, now_s);
                 return vec![MccAction::Reject {
                     code: "invalid_ike_message_binding",
@@ -1527,8 +1530,7 @@ impl MccNodeMachine {
         let Some(resp) = cached else {
             return Ok(Vec::new());
         };
-        let hdr = parse_ikev2_packet(resp.udp_port, &resp.payload)
-            .map_err(|_| CascadeError::new("invalid_ike_message_binding"))?;
+        let hdr = parse_control_handshake(resp.udp_port, &resp.payload)?;
         self.send_local_response(
             &verified.sender,
             &resp.payload,
@@ -1731,8 +1733,7 @@ impl MccNodeMachine {
                     return Err(CascadeError::new("invalid_response_body"));
                 }
                 let parsed = validate_ike_fields(&verified, &body, true)?;
-                let hdr = parse_ikev2_packet(parsed.udp_port, &parsed.payload)
-                    .map_err(|_| CascadeError::new("invalid_ike_message_binding"))?;
+                let hdr = parse_control_handshake(parsed.udp_port, &parsed.payload)?;
 
                 let body_bke = body["bke"].as_str().unwrap_or("");
                 let body_apub = body["a_to_b_ke"].as_str().unwrap_or("");
@@ -2235,6 +2236,72 @@ struct ValidatedRequest {
     request_digest: String,
 }
 
+struct ControlHandshakeHeader {
+    initiator_spi: [u8; 8],
+    exchange_type: u8,
+    message_id: u32,
+    is_response: bool,
+    msg_id_str: String,
+}
+
+fn parse_control_handshake(
+    udp_port: u16,
+    payload: &[u8],
+) -> Result<ControlHandshakeHeader, CascadeError> {
+    match udp_port {
+        500 | 4500 => {
+            let hdr = parse_ikev2_packet(udp_port, payload)
+                .map_err(|_| CascadeError::new("invalid_ike_message_binding"))?;
+            Ok(ControlHandshakeHeader {
+                initiator_spi: hdr.initiator_spi,
+                exchange_type: hdr.exchange_type,
+                message_id: hdr.message_id,
+                is_response: hdr.is_response(),
+                msg_id_str: format!("{}:{}", hdr.exchange_type, hdr.message_id),
+            })
+        }
+        WG_OVERLAY_CONTROL_PORT => {
+            let wg = parse_wireguard_packet_rfc(payload)
+                .map_err(|_| CascadeError::new("invalid_wg_handshake_binding"))?;
+            if wg.is_transport() {
+                return Err(CascadeError::new("wg_transport_forbidden_in_overlay"));
+            }
+            match wg.message_type {
+                WireGuardMessageType::HandshakeInitiation => {
+                    let idx = wg
+                        .sender_index
+                        .ok_or_else(|| CascadeError::new("invalid_wg_handshake_binding"))?;
+                    let le = idx.to_le_bytes();
+                    Ok(ControlHandshakeHeader {
+                        initiator_spi: [b'W', b'G', 0, 0, le[0], le[1], le[2], le[3]],
+                        exchange_type: 1,
+                        message_id: idx,
+                        is_response: false,
+                        msg_id_str: format!("wg:1:{idx}"),
+                    })
+                }
+                WireGuardMessageType::HandshakeResponse | WireGuardMessageType::CookieReply => {
+                    let idx = wg
+                        .receiver_index
+                        .ok_or_else(|| CascadeError::new("invalid_wg_handshake_binding"))?;
+                    let le = idx.to_le_bytes();
+                    Ok(ControlHandshakeHeader {
+                        initiator_spi: [b'W', b'G', 0, 0, le[0], le[1], le[2], le[3]],
+                        exchange_type: 1,
+                        message_id: idx,
+                        is_response: true,
+                        msg_id_str: format!("wg:1:{idx}"),
+                    })
+                }
+                WireGuardMessageType::TransportData => {
+                    Err(CascadeError::new("wg_transport_forbidden_in_overlay"))
+                }
+            }
+        }
+        _ => Err(CascadeError::new("invalid_ike_port")),
+    }
+}
+
 fn validate_ike_fields(
     verified: &VerifiedMessage,
     body: &BTreeMap<String, CanonicalValue>,
@@ -2260,7 +2327,7 @@ fn validate_ike_fields(
             .get(k)
             .and_then(CanonicalValue::as_i64)
             .ok_or_else(|| CascadeError::new("invalid_ike_port"))?;
-        if p != 500 && p != 4500 {
+        if p != 500 && p != 4500 && p != i64::from(WG_OVERLAY_CONTROL_PORT) {
             return Err(CascadeError::new("invalid_ike_port"));
         }
         Ok(p as u16)
@@ -2288,10 +2355,8 @@ fn validate_ike_fields(
     let ike_src_ip = get_ip("ike_src_ip")?;
     let ike_dst_ip = get_ip("ike_dst_ip")?;
 
-    let hdr = parse_ikev2_packet(udp_port, &payload)
-        .map_err(|_| CascadeError::new("invalid_ike_message_binding"))?;
-    let expected_msg_id = format!("{}:{}", hdr.exchange_type, hdr.message_id);
-    if hdr.is_response() != expected_response || expected_msg_id != verified.message_id {
+    let hdr = parse_control_handshake(udp_port, &payload)?;
+    if hdr.is_response != expected_response || hdr.msg_id_str != verified.message_id {
         return Err(CascadeError::new("invalid_ike_message_binding"));
     }
 

@@ -73,8 +73,22 @@ impl WireGuardPacket {
     }
 }
 
-/// Validates public WireGuard packet framing without panicking or inspecting encrypted contents.
+/// Validates public WireGuard packet framing (strict 16-byte padded `TransportData` for Python parity).
 pub fn parse_wireguard_packet(packet: &[u8]) -> Result<WireGuardPacket, ProtoError> {
+    parse_wireguard_packet_inner(packet, true)
+}
+
+/// Validates public WireGuard packet framing per WireGuard specification Section 5.4.6
+/// (accepts both 16-byte padded Linux/wireguard-go and unpadded `boringtun` Type 4 packets `>= 32` B,
+/// while keeping exact `148`/`92`/`64` byte lengths and zero reserved bytes for Types 1/2/3).
+pub fn parse_wireguard_packet_rfc(packet: &[u8]) -> Result<WireGuardPacket, ProtoError> {
+    parse_wireguard_packet_inner(packet, false)
+}
+
+fn parse_wireguard_packet_inner(
+    packet: &[u8],
+    require_transport_padding: bool,
+) -> Result<WireGuardPacket, ProtoError> {
     if packet.len() < 4 {
         return Err(ProtoError::InvalidWireGuardPacket);
     }
@@ -129,7 +143,9 @@ pub fn parse_wireguard_packet(packet: &[u8]) -> Result<WireGuardPacket, ProtoErr
             })
         }
         WireGuardMessageType::TransportData => {
-            if packet.len() < WG_TRANSPORT_MIN_LEN || packet.len() % 16 != 0 {
+            if packet.len() < WG_TRANSPORT_MIN_LEN
+                || (require_transport_padding && packet.len() % 16 != 0)
+            {
                 return Err(ProtoError::InvalidWireGuardPacket);
             }
             let receiver_index = u32::from_le_bytes([packet[4], packet[5], packet[6], packet[7]]);
