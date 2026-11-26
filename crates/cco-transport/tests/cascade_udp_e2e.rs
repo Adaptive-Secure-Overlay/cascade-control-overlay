@@ -396,3 +396,298 @@ async fn live_udp_four_node_f4_ikev2_m_3_5_10_with_repeats() {
         }
     }
 }
+
+#[tokio::test]
+async fn relay_restart_auto_recovers_mgmt_session_and_resumes_cascade_without_restarting_peers() {
+    let dir = TempDir::new().unwrap();
+    let names = vec![
+        "A".to_owned(),
+        "X1".to_owned(),
+        "X2".to_owned(),
+        "B".to_owned(),
+    ];
+
+    let root_sk = Ed25519SecretKey::generate();
+    let mut signers = BTreeMap::new();
+    signers.insert("restart-root".to_owned(), root_sk.public_key());
+    let root_path = dir.path().join("root.json");
+    fs::write(&root_path, build_trust_root_bytes(&signers).unwrap()).unwrap();
+
+    let ports = pick_free_udp_ports(names.len());
+    let mut signing = BTreeMap::new();
+    let mut encryption = BTreeMap::new();
+    let mut records = BTreeMap::new();
+    let mut peers = BTreeMap::new();
+
+    for (idx, name) in names.iter().enumerate() {
+        let esk = Ed25519SecretKey::generate();
+        let xsk = X25519SecretKey::generate();
+        records.insert(
+            name.clone(),
+            NodeKeyRecord {
+                encryption: xsk.public_key(),
+                verification: esk.public_key(),
+                key_id: esk.public_key().key_id(),
+                revoked: false,
+            },
+        );
+        signing.insert(name.clone(), esk);
+        encryption.insert(name.clone(), xsk);
+        peers.insert(
+            name.clone(),
+            PeerEndpoint {
+                name: name.clone(),
+                overlay_addr: SocketAddr::from(([127, 0, 0, 1], ports[idx])),
+                underlay_ip: Ipv4Addr::new(192, 0, 2, (40 + idx) as u8),
+            },
+        );
+    }
+
+    let reg_bytes = sign_registry_v2(1, &records, "restart-root", &root_sk).unwrap();
+    let verified = verify_registry_bytes(
+        &reg_bytes,
+        &root_path,
+        names.iter().map(String::as_str),
+        VerifyConstraints::default(),
+    )
+    .unwrap();
+    let now_s = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_secs() as i64;
+
+    let delivered: DeliveredLog = Arc::new(StdMutex::new(Vec::new()));
+    let notify = Arc::new(Notify::new());
+    let mut handles = BTreeMap::new();
+
+    let make_cfg = |name: &str, preconnect: bool| {
+        let mut cfg = NodeTransportConfig::new(name, peers[name].overlay_addr, peers.clone());
+        cfg.route_mode = RouteMode::Cascade;
+        cfg.cascade = CascadeTransportConfig {
+            hops: 3,
+            max_hops: 16,
+            hop_model: HopSelectionModel::F4WithRep,
+            parallel_chains: 2,
+            route_ttl_secs: 120.0,
+        };
+        cfg.preconnect = preconnect;
+        cfg
+    };
+
+    for name in &names {
+        let sec = EndpointSecurity::new(
+            name,
+            verified.clone(),
+            Ed25519SecretKey::from_bytes(*signing[name].to_bytes_zeroizing()),
+            X25519SecretKey::from_bytes(*encryption[name].to_bytes_zeroizing()),
+            dir.path().join(format!("{name}.sqlite")),
+            now_s,
+        )
+        .unwrap();
+        let slot = Arc::new(StdMutex::new(None));
+        let sink: Arc<dyn IkeSink> = if name == "A" || name == "B" {
+            Arc::new(AutoReplyIkeSink {
+                node_name: name.clone(),
+                delivered: Arc::clone(&delivered),
+                notify: Arc::clone(&notify),
+                handle_slot: Arc::clone(&slot),
+                auto_reply: name == "B",
+            })
+        } else {
+            Arc::new(cco_transport::RelayOnlySink)
+        };
+        let handle = OverlayNode::start(make_cfg(name, true), sec, sink)
+            .await
+            .unwrap();
+        if name == "B" {
+            *slot.lock().unwrap() = Some(handle.clone());
+        }
+        handles.insert(name.clone(), handle);
+    }
+
+    tokio::time::sleep(Duration::from_millis(250)).await;
+
+    // 1. Initial 3-hop F4 cascade exchange works normally.
+    let spi1 = [0x91, 0x92, 0x93, 0x94, 0x01, 0x01, 0x01, 0x01];
+    handles["A"]
+        .send_local_ike(
+            "B",
+            build_ikev2(500, IKE_SA_INIT, 0, false, spi1, b"pre-restart"),
+            500,
+        )
+        .await
+        .unwrap();
+    wait_deliveries(&delivered, &notify, 2).await;
+
+    let old_x2_x1_sid = handles["X2"]
+        .active_session_id("X1")
+        .await
+        .expect("X2 must hold an active MGMT session with X1 before restart");
+    let old_a_x1_sid = handles["A"]
+        .active_session_id("X1")
+        .await
+        .expect("A must hold an active MGMT session with X1 before restart");
+
+    // 2. Kill relay X1 and restart it fresh with `preconnect = false` (empty session table!)
+    //    while A, X2, and B still retain their stale MGMT sessions to X1.
+    handles.remove("X1").unwrap().shutdown().await;
+    let x1_new = {
+        let mut started = None;
+        for _ in 0..20 {
+            tokio::time::sleep(Duration::from_millis(40)).await;
+            let sec = EndpointSecurity::new(
+                "X1",
+                verified.clone(),
+                Ed25519SecretKey::from_bytes(*signing["X1"].to_bytes_zeroizing()),
+                X25519SecretKey::from_bytes(*encryption["X1"].to_bytes_zeroizing()),
+                dir.path().join("X1.sqlite"),
+                now_s,
+            )
+            .unwrap();
+            if let Ok(h) = OverlayNode::start(
+                make_cfg("X1", false),
+                sec,
+                Arc::new(cco_transport::RelayOnlySink),
+            )
+            .await
+            {
+                started = Some(h);
+                break;
+            }
+        }
+        started.expect("restarted relay X1 must rebind its overlay UDP port")
+    };
+    handles.insert("X1".to_owned(), x1_new);
+    assert!(!handles["X1"].has_session("X2").await);
+    assert!(!handles["X1"].has_session("A").await);
+    assert_eq!(
+        handles["X2"].active_session_id("X1").await.as_deref(),
+        Some(old_x2_x1_sid.as_str())
+    );
+
+    // 3. X2 sends an encrypted frame to restarted X1 using its stale old session key.
+    //    X1 must NOT stay stuck: it must automatically initiate a fresh 4-step MGMT handshake
+    //    with X2 (without plaintext ERROR trust), updating both sides to a brand-new `sid`!
+    handles["X2"]
+        .send_secure_message(
+            "X1",
+            cco_proto::MessageType::CascadeClose,
+            br#"{"v":2,"route_handle":"deadbeef"}"#.to_vec(),
+        )
+        .await
+        .unwrap();
+
+    let recovery_deadline = tokio::time::Instant::now() + Duration::from_secs(4);
+    loop {
+        let x1_has_x2 = handles["X1"].has_session("X2").await;
+        let x2_sid = handles["X2"].active_session_id("X1").await;
+        if x1_has_x2 && x2_sid.as_deref() != Some(old_x2_x1_sid.as_str()) {
+            assert_eq!(handles["X1"].active_session_id("X2").await, x2_sid);
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < recovery_deadline,
+            "timed out waiting for X1<->X2 automatic MGMT session recovery"
+        );
+        tokio::time::sleep(Duration::from_millis(30)).await;
+    }
+
+    // 4. Trigger a brand-new 3-hop F4 cascade exchange from A -> B (A and B still hold stale
+    //    sessions to X1!). If the first attempt hits stale A<->X1 or B<->X1, X1 self-heals them
+    //    automatically, and the cascade exchange completes end-to-end without restarting A, X2, or B!
+    handles["A"].close_cascade_route("B").await;
+    let mut active_spi = [0x95, 0x96, 0x97, 0x98, 0x02, 0x02, 0x02, 0x02];
+    handles["A"]
+        .send_local_ike(
+            "B",
+            build_ikev2(
+                500,
+                IKE_SA_INIT,
+                0,
+                false,
+                active_spi,
+                b"probe-after-restart",
+            ),
+            500,
+        )
+        .await
+        .unwrap();
+
+    // Wait briefly; if initial probe triggered auto-recovery on A<->X1 or B<->X1, send follow-up.
+    tokio::time::sleep(Duration::from_millis(400)).await;
+    if delivered.lock().unwrap().len() < 4 {
+        handles["A"].close_cascade_route("B").await;
+        active_spi = [0x99, 0x9a, 0x9b, 0x9c, 0x03, 0x03, 0x03, 0x03];
+        handles["A"]
+            .send_local_ike(
+                "B",
+                build_ikev2(500, IKE_SA_INIT, 0, false, active_spi, b"post-restart-ok"),
+                500,
+            )
+            .await
+            .unwrap();
+        wait_deliveries(&delivered, &notify, 4).await;
+    }
+
+    // Complete IKE_AUTH over the recovered 3-hop cascade route and confirm X1 actively relayed it!
+    let before_auth = delivered.lock().unwrap().len();
+    handles["A"]
+        .send_local_ike(
+            "B",
+            build_ikev2(500, IKE_AUTH, 1, false, active_spi, b"post-restart-auth"),
+            500,
+        )
+        .await
+        .unwrap();
+    wait_deliveries(&delivered, &notify, before_auth + 2).await;
+
+    let x1_active = handles["X1"]
+        .cascade_relay_knowledge()
+        .await
+        .into_iter()
+        .filter(|c| c.state == "active")
+        .count();
+    assert!(
+        x1_active >= 1,
+        "restarted relay X1 must actively participate in the recovered 3-hop F4 cascade"
+    );
+    if handles["X1"].has_session("A").await {
+        assert_ne!(
+            handles["A"].active_session_id("X1").await.as_deref(),
+            Some(old_a_x1_sid.as_str()),
+            "A <-> X1 must have rotated away from the pre-restart stale session"
+        );
+    }
+
+    // 5. Security regression check: forged/unauthenticated encrypted garbage from an attacker
+    //    impersonating X2 must NOT drop X1's live active session and must stay rate-limited.
+    let sid_before_spoof = handles["X1"]
+        .active_session_id("X2")
+        .await
+        .expect("X1 must have active session with X2");
+    let spoof_sock = StdUdpSocket::bind("127.0.0.1:0").unwrap();
+    let forged_env = serde_json::json!({
+        "t": "CASCADE_CLOSE",
+        "sid": sid_before_spoof,
+        "from": "X2",
+        "to": "X1",
+        "nonce": "000000000000000000000000",
+        "ct": "deadbeefdeadbeefdeadbeefdeadbeefdeadbeef",
+        "meta": {}
+    })
+    .to_string();
+    for _ in 0..5 {
+        spoof_sock
+            .send_to(forged_env.as_bytes(), peers["X1"].overlay_addr)
+            .unwrap();
+    }
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert!(
+        handles["X1"].has_session("X2").await,
+        "forged SecureEnvelope must never wipe a live MGMT session"
+    );
+
+    for h in handles.values() {
+        h.shutdown().await;
+    }
+}

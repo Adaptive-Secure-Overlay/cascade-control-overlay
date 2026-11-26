@@ -36,6 +36,8 @@ use crate::mgmt::{
 };
 
 const MAX_PENDING_PER_PEER: usize = 512;
+/// Minimum interval between unsolicited MGMT session-recovery handshakes per peer (DoS guard).
+const SESSION_RECOVERY_COOLDOWN: Duration = Duration::from_millis(1_500);
 
 type PendingSendMap = HashMap<String, VecDeque<(MessageType, Vec<u8>)>>;
 type PendingInitAuth = (InitiatorHandshake, Key256, oneshot::Sender<bool>);
@@ -158,6 +160,7 @@ struct SharedTransport {
     hs_init_waiters: Mutex<HashMap<String, oneshot::Sender<MgmtInitResp>>>,
     pending_init_auth: Mutex<HashMap<String, PendingInitAuth>>,
     inflight_ensure: Mutex<HashMap<String, Arc<Notify>>>,
+    session_recovery_last: Mutex<HashMap<String, tokio::time::Instant>>,
     pending_sends: Mutex<PendingSendMap>,
     reassembler: Mutex<LinkFragReassembler>,
     machine: Mutex<MccNodeMachine>,
@@ -281,6 +284,16 @@ impl OverlayNodeHandle {
     /// Checks whether an active MGMT session currently exists for `peer`.
     pub async fn has_session(&self, peer: &str) -> bool {
         self.shared.sessions.lock().await.contains_key(peer)
+    }
+
+    /// Returns the active MGMT session identifier (`sid`) for `peer`, if established.
+    pub async fn active_session_id(&self, peer: &str) -> Option<String> {
+        self.shared
+            .sessions
+            .lock()
+            .await
+            .get(peer)
+            .map(|slot| slot.active.sid.clone())
     }
 
     /// Returns initiator route summary `(x1, opaque_token, context)` for `(dst, spi)`, if ready (`mcc2`).
@@ -427,6 +440,7 @@ impl OverlayNode {
             hs_init_waiters: Mutex::new(HashMap::new()),
             pending_init_auth: Mutex::new(HashMap::new()),
             inflight_ensure: Mutex::new(HashMap::new()),
+            session_recovery_last: Mutex::new(HashMap::new()),
             pending_sends: Mutex::new(HashMap::new()),
             reassembler: Mutex::new(LinkFragReassembler::new(self_name)),
             machine: Mutex::new(machine),
@@ -729,10 +743,58 @@ async fn ensure_session_async(
     shared: Arc<SharedTransport>,
     peer: &str,
 ) -> Result<(), TransportError> {
+    ensure_session_inner(shared, peer, false).await
+}
+
+/// Triggers a rate-limited MGMT session recovery (`MGMT_INIT -> MGMT_AUTH`) after receiving an
+/// encrypted frame from a known peer whose session is missing or stale (e.g. after relay restart).
+/// Never trusts unauthenticated plaintext `ERROR` frames and never drops an active session before
+/// the replacement handshake completes cryptographically.
+async fn trigger_rate_limited_session_recovery(
+    shared: Arc<SharedTransport>,
+    peer: &str,
+    force_rekey: bool,
+) {
+    let now = tokio::time::Instant::now();
+    {
+        let mut rl = shared.session_recovery_last.lock().await;
+        if let Some(&last) = rl.get(peer) {
+            if now.duration_since(last) < SESSION_RECOVERY_COOLDOWN {
+                debug!(
+                    node = %shared.self_name,
+                    peer,
+                    "rate-limited MGMT session recovery trigger"
+                );
+                return;
+            }
+        }
+        rl.insert(peer.to_owned(), now);
+    }
+    info!(
+        node = %shared.self_name,
+        peer,
+        force_rekey,
+        "initiating rate-limited MGMT session recovery for unknown/stale encrypted frame"
+    );
+    let peer_owned = peer.to_owned();
+    tokio::spawn(async move {
+        let _ = ensure_session_inner(shared, &peer_owned, force_rekey).await;
+    });
+}
+
+async fn ensure_session_inner(
+    shared: Arc<SharedTransport>,
+    peer: &str,
+    force_rekey: bool,
+) -> Result<(), TransportError> {
     if peer == shared.self_name || !shared.config.peers.contains_key(peer) {
         return Err(TransportError::UnknownPeer);
     }
-    if shared.sessions.lock().await.contains_key(peer) {
+    let initial_sid = {
+        let sessions = shared.sessions.lock().await;
+        sessions.get(peer).map(|slot| slot.active.sid.clone())
+    };
+    if !force_rekey && initial_sid.is_some() {
         flush_pending_sends(Arc::clone(&shared), peer).await;
         return Ok(());
     }
@@ -754,7 +816,15 @@ async fn ensure_session_async(
                 .udp_timeout_ms
                 .saturating_mul(shared.config.retries.max(1) as u64),
         );
-        if !shared.sessions.lock().await.contains_key(peer) {
+        let ready = {
+            let sessions = shared.sessions.lock().await;
+            match sessions.get(peer) {
+                Some(_) if !force_rekey => true,
+                Some(slot) => initial_sid.as_deref() != Some(slot.active.sid.as_str()),
+                None => false,
+            }
+        };
+        if !ready {
             let _ = tokio::time::timeout(wait_limit, notify.notified()).await;
         }
         return if shared.sessions.lock().await.contains_key(peer) {
@@ -770,7 +840,15 @@ async fn ensure_session_async(
     let mut established = false;
 
     for _attempt in 0..retries {
-        if shared.sessions.lock().await.contains_key(peer) {
+        let already_ready = {
+            let sessions = shared.sessions.lock().await;
+            match sessions.get(peer) {
+                Some(_) if !force_rekey => true,
+                Some(slot) => initial_sid.as_deref() != Some(slot.active.sid.as_str()),
+                None => false,
+            }
+        };
+        if already_ready {
             established = true;
             break;
         }
@@ -1165,19 +1243,21 @@ async fn handle_udp_packet(shared: Arc<SharedTransport>, data: Vec<u8>, src: Soc
             let Ok(env) = serde_json::from_value::<SecureEnvelope>(val) else {
                 return;
             };
-            let plain = {
-                let mut sessions = shared.sessions.lock().await;
-                let Some(slot) = sessions.get(&peer) else {
+            let decrypt_result = {
+                let sessions = shared.sessions.lock().await;
+                match sessions.get(&peer) {
+                    None => Err(false),
+                    Some(slot) => match slot.decrypt(&shared.self_name, &env) {
+                        Ok(pt) => Ok(pt),
+                        Err((_, _is_active_sid)) => Err(true),
+                    },
+                }
+            };
+            let plain = match decrypt_result {
+                Ok(pt) => pt,
+                Err(had_session) => {
+                    trigger_rate_limited_session_recovery(shared, &peer, had_session).await;
                     return;
-                };
-                match slot.decrypt(&shared.self_name, &env) {
-                    Ok(pt) => pt,
-                    Err((_, is_active_sid)) => {
-                        if is_active_sid {
-                            sessions.remove(&peer);
-                        }
-                        return;
-                    }
                 }
             };
             update_authenticated_peer_addr(&shared, &peer, src).await;
