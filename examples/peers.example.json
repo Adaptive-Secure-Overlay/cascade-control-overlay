@@ -1,0 +1,22 @@
+[
+  {
+    "name": "A",
+    "overlay_addr": "192.0.2.10:9000",
+    "underlay_ip": "192.0.2.10"
+  },
+  {
+    "name": "X1",
+    "overlay_addr": "192.0.2.11:9000",
+    "underlay_ip": "192.0.2.11"
+  },
+  {
+    "name": "X2",
+    "overlay_addr": "192.0.2.12:9000",
+    "underlay_ip": "192.0.2.12"
+  },
+  {
+    "name": "B",
+    "overlay_addr": "192.0.2.13:9000",
+    "underlay_ip": "192.0.2.13"
+  }
+]

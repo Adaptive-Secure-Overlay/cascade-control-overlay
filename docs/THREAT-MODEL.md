@@ -1,0 +1,38 @@
+# Threat Model & Boundaries of Applicability
+
+This threat model mirrors the formal assumptions of the dissertation (Chapters 1, 2, 3, and Section 4.3.4) without overclaiming guarantees outside the studied model.
+
+---
+
+## 1. Protected Assets
+
+1. **VPN Handshake Confidentiality & Linkability at the Local Provider Edge:** Preventing a local provider-plane observer between endpoint `A` and endpoint `B` from observing direct `A <-> B` IKEv2 (`UDP/500`, `UDP/4500` Non-ESP) or WireGuard (`type 1/2/3`) control exchanges.
+2. **Control-Plane Integrity & Authenticity:** Preventing untrusted or compromised relays (`X1`, `X2`, or intermediate `UniversalCascade` hops) from forging, substituting, replaying, or tampering with IKEv2 / WireGuard handshake messages.
+3. **Hop-Scope Role Isolation (Privacy):**
+   - `X1` learns `A` and candidate `X2` nodes, but cannot decrypt `endpoint` capsules or learn `B` from the hop layer.
+   - `X2` learns `X1` and `B`, but cannot decrypt `endpoint` capsules or learn `A` from the hop layer.
+   - Initiator `A` continues `IKE_AUTH` via `opaque_token` without learning which `X2` branch `B` selected.
+4. **Trust Catalog Integrity:** Preventing unauthorized node injection, key substitution, key reuse, or downgrade to a revoked/stale node directory.
+
+---
+
+## 2. Adversary Capabilities Addressed
+
+| Threat | Mitigation Implemented | Verification |
+| :--- | :--- | :--- |
+| **Provider-plane direct IKE/WG sniffing** | `nftables` captures only IKEv2 control (UDP/500 & UDP/4500 Non-ESP `00 00 00 00`), routing it via encrypted multi-hop MCC (`UDP/9000`). | Live L3 `netns_e2e.sh` pcap audit: `direct_ike_total == 0`. |
+| **Active relay tampering / wrapper spoofing** | Receiver `B` opens `endpoint` capsule and verifies `Ed25519` (`verify_strict`) + signed fields (`src`, `dst`, `context`, `ike_payload`, `request_digest`, `selection`) **before** allocating pending state or ledger rows; contradictory outer wrapper fields are rejected. | `cco-cascade/tests/mcc_suite.rs` (forged first/last offers, all-bad burst allocates zero state). |
+| **Replay / duplicate injection across restarts** | Durable SQLite at-most-once ledger reserves `(message_key)` before emitting move-only `LocalDeliveryProof`; `Unknown` injection outcome locks the claim permanently. | `mcc_suite.rs::twenty_seven_copies_and_restart_durable_anti_replay` & `rejected_injection_fails_over_while_unknown_forbids_retry`. |
+| **Trust Registry downgrade / corruption** | Pinned external root (`trust-root/v1`), strict duplicate-free canonical JSON, strictly monotonic version store, SHA-256 verification on equal version, atomic `fsync + rename`, verified `last-valid` recovery. | `cco-trust/tests/security_matrix.rs` (12 negative & recovery tests). |
+| **Data-plane hijacking into overlay** | `nftables` Non-ESP filter (`@th,64,32 0x00000000`), `cco-proto` `is_ike_payload` guard, `cco-proto` WireGuard `type 4` hard rejection, `ip xfrm policy` bypass for overlay UDP port. | `cco-proto` unit tests, `wireguard_suite.rs` (27 scenarios), `cco-linux-proxy` unit tests & L3 live lab. |
+| **Compromised subset of `m` honest-but-curious relays** | Combinatorial route-space expansion (`F3` / `F4` models + MCC multi-branch fanout) quantifies exact interception probability and minimum network size `n50`. | `cco-analytics/tests/analytics_suite.rs` (exact match to Chapter 3 + 2.4M Monte Carlo trials). |
+
+---
+
+## 3. Explicit Non-Goals & Limitations
+
+1. **Global Passive Adversary (GPA):** If an adversary monitors all network links simultaneously and correlates packet timings/sizes across `A -> X1`, `X1 -> X2`, `X2 -> B`, the overlay does not provide strong traffic-analysis anonymity. (In the dissertation's Section 4.3.5 evaluation across 4,500 local traces with 9 candidate recipients, packet-sequence metadata classifiers achieved 23.07% accuracy on random splits and 17.20% on held-out parameter cells — above random guessing `11.11%`, demonstrating that local timing/size side channels exist and must be stated transparently.)
+2. **Direct Data Plane After Handshake:** Once IPsec `CHILD_SA` or WireGuard session keys are established, `ESP` (proto 50 / UDP 4500) or WireGuard `type 4` packets traverse the direct path between `A` and `B` to preserve native VPN latency and throughput. Anyone observing the `A <-> B` underlay after setup sees direct encrypted ESP/WireGuard traffic.
+3. **Colluding `X1 + X2` on the Same Branch:** If both intermediate relays on the selected branch collude, they can link `A` and `B` for that branch (modeled analytically in `cco-analytics`).
+4. **End-Host Compromise:** Compromise of endpoint `A` or `B` private signing/encryption keys or the offline root signing key breaks trust assumptions until revoked via a newer signed Trust Registry v2 release.
+5. **Audit Status:** Experimental research software; not externally audited for production deployment.

@@ -1,0 +1,51 @@
+# Reference topology configuration using RFC 5737 documentation ranges ONLY
+# (192.0.2.0/24 TEST-NET-1, 198.51.100.0/24 TEST-NET-2, 203.0.113.0/24 TEST-NET-3).
+#
+# Never store private keys or passwords in version control. Generate per-node
+# Ed25519 signing and X25519 encryption keys locally with `cco trust-admin keygen`.
+
+[overlay]
+udp_port = 9000
+selection_mode = "adaptive"   # first | window | adaptive | wait-all
+x1_fanout = 2
+x2_fanout = 2
+ike_fanout = 1
+min_copies = 3
+quiet_ms = 150
+deadline_ms = 12000
+
+[trust]
+schema = "ipsec-ike-cascade-trust-registry/v2"
+trust_root = "examples/trust-root.example.json"
+trust_registry = "examples/trust-registry.example.json"
+
+[linux_proxy]
+socket_mark = "0x53"
+capture_base_500 = 15100
+capture_base_4500 = 15200
+
+[[nodes]]
+name = "A"
+role = "endpoint"
+underlay_ip = "192.0.2.10"
+overlay_addr = "192.0.2.10:9000"
+tunnel_cidr = "198.51.100.10/32"
+
+[[nodes]]
+name = "X1"
+role = "relay"
+underlay_ip = "192.0.2.11"
+overlay_addr = "192.0.2.11:9000"
+
+[[nodes]]
+name = "X2"
+role = "relay"
+underlay_ip = "192.0.2.12"
+overlay_addr = "192.0.2.12:9000"
+
+[[nodes]]
+name = "B"
+role = "endpoint"
+underlay_ip = "192.0.2.13"
+overlay_addr = "192.0.2.13:9000"
+tunnel_cidr = "198.51.100.13/32"
