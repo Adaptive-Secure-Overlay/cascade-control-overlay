@@ -1,0 +1,106 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  pull_request:
+    branches: [main]
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  fmt-and-clippy:
+    name: Format & Clippy
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo fmt --all -- --check
+      - run: cargo clippy --workspace --all-targets -- -D warnings
+
+  test:
+    name: Test (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install Python cryptography for Rust<->Python wire cross-compat E2E
+        run: python -m pip install --quiet cryptography
+      - run: cargo test --workspace
+
+  musl-build:
+    name: Static Linux musl Binary (L4 Drop-In)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install musl-tools
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends musl-tools
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-unknown-linux-musl
+      - uses: Swatinem/rust-cache@v2
+      - name: Build static x86_64-unknown-linux-musl binary
+        run: |
+          cargo build --release --target x86_64-unknown-linux-musl -p cco-cli
+          strip target/x86_64-unknown-linux-musl/release/cco
+          ls -lh target/x86_64-unknown-linux-musl/release/cco
+      - uses: actions/upload-artifact@v4
+        with:
+          name: cco-linux-x86_64-musl
+          path: target/x86_64-unknown-linux-musl/release/cco
+
+  bench-smoke:
+    name: Benchmark & WireGuard Matrix Smoke
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Run release CLI smokes
+        run: |
+          cargo build --release -p cco-cli
+          ./target/release/cco bench crypto --iters 50
+          ./target/release/cco bench monte-carlo --trials 200000 --n 10 --m 2 --j 3
+          ./target/release/cco wg-sim --format eve-json >/dev/null
+
+  netns-l3-live:
+    name: Live Linux netns + strongSwan + nftables (L3)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Install strongSwan, nftables, and tcpdump
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            strongswan strongswan-swanctl strongswan-charon \
+            nftables iproute2 tcpdump iputils-ping openssl
+      - name: Build release cco binary
+        run: cargo build --release -p cco-cli
+      - name: Run live 4-node strongSwan overlay verification
+        run: |
+          chmod +x lab/scripts/*.sh
+          sudo CCO_BIN="$PWD/target/release/cco" bash lab/scripts/netns_e2e.sh
+
+  security-audit:
+    name: Cargo Security Audit
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: rustsec/audit-check@v2
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
