@@ -219,6 +219,21 @@ impl EndpointSecurity {
         &self.state_path
     }
 
+    /// Builds a verified [`crate::universal::CascadeIdentity`] (both X25519 encryption and
+    /// Ed25519 end-to-end signing keys) backed by this endpoint's pinned Trust Registry v2.
+    pub fn build_cascade_identity(
+        &self,
+    ) -> Result<crate::universal::CascadeIdentity, CascadeError> {
+        let enc_bytes = self.encryption.to_bytes_zeroizing();
+        let sig_bytes = self.signing.to_bytes_zeroizing();
+        crate::universal::CascadeIdentity::from_verified_registry_signed(
+            self.name.clone(),
+            X25519SecretKey::from_bytes(*enc_bytes),
+            Ed25519SecretKey::from_bytes(*sig_bytes),
+            &self.registry,
+        )
+    }
+
     /// Replaces the verified registry (e.g. after an atomic trust-store update).
     pub fn update_registry(&mut self, registry: VerifiedRegistry) -> Result<(), CascadeError> {
         let own = registry

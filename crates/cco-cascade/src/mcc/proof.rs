@@ -96,6 +96,22 @@ impl LocalDeliveryProof {
         }
     }
 
+    /// Mints a single-use local delivery proof for a verified Universal H-hop Cascade delivery.
+    ///
+    /// Called only after end-to-end AEAD decryption, Ed25519 signature verification (when enabled),
+    /// and exchange-level deduplication inside [`crate::universal::UniversalCascade`].
+    #[must_use]
+    pub fn mint_cascade(payload: Vec<u8>, meta: DeliveredIkeMeta) -> Self {
+        let message_key = meta.message_key.clone();
+        let copy_id = meta.copy_id;
+        Self {
+            payload,
+            meta,
+            message_key,
+            copy_id,
+        }
+    }
+
     /// Borrows the verified IKE payload bytes before consumption.
     #[must_use]
     pub fn payload(&self) -> &[u8] {
