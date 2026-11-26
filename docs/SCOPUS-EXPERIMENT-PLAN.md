@@ -38,6 +38,15 @@ Already reproduced in automated CI (`netns-l3-live` and `wg-userspace-l3-live`):
 | Kernel IPsec (`strongSwan 5.9.5` + `cco node`) | IKEv2 UDP/500 & 4500 via MCC `A -> X1 -> X2 -> B` | **`0`** | Direct kernel XFRM ESP (`proto 50`) | `0.101 ms` (`0%` loss) | `< 150 ms` | Linux `CAP_NET_ADMIN` + `nftables` |
 | Userspace WG (`boringtun 0.7.1` + `cco wg-tunnel`) | WG Type 1/2/3 via MCC `A -> X1 -> X2 -> B` | **`0`** | Direct userspace WG Type 4 UDP | `0.452 ms` (`0%` loss) | `105 ms` | Rootless Android `VpnService` / signed `Wintun` / macOS `utun` |
 
+### Completed Geo-Distributed 4-Node WAN Measurements (Dual NAT, `BENCHMARKS.md §6`)
+
+Executed across 4 real WAN hosts (`Node A [Home NAT] -> Node X1 [City-1] -> Node X2 [City-2] -> Node B [City-3 NAT]`):
+
+| Architecture (Live 4-Node WAN) | Initial Handshake | Direct Control Leakage | Avg Tunnel RTT | `iperf3` 4-Stream TCP (`A->B` / `B->A`) | Seamless Rekey (`0%` Ping Loss) |
+| :--- | :---: | :---: | :---: | :---: | :---: |
+| Kernel IPsec (`strongSwan 5.9.8` + Rust `cco`) | `529.0 ms` | **`0`** (`500`/`4500` Non-ESP) | `24.46 ms` | `69.2` / `86.6 Mbps` (receiver) | `CHILD_SA 275 ms`, `IKE_SA 258 ms` (`40/40`, `0` direct IKE) |
+| Userspace WG (`boringtun 0.7.1` + Rust `cco`) | **`128.0 ms`** | **`0`** (`Type 1/2/3`) | `25.45 ms` | **`70.3`** / `86.0 Mbps` (receiver) | Auto `120 s` PFS rekey (`62/62`, `0` direct WG ctrl) |
+
 ## Artifact Archival Checklist for Paper Submission
 
 - Pin exact Git tag (e.g., `v0.2.0`) and release `SHA256SUMS.txt`.

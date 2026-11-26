@@ -111,3 +111,35 @@ sudo CCO_BIN=./target/release/cco bash lab/scripts/wg_userspace_e2e.sh
 - **Windows (`apps/windows`):** `cco_ffi.dll` = **`5.26 MB`**, `CcoOverlayWindows.exe` = **`156 KB`**, official signed `wintun.dll` (`WireGuard LLC`, 0.14.1, SHA-256 verified at build time) = **`428 KB`**.
 - **C-ABI & P/Invoke / XCTest roundtrip:** full 4-node split WireGuard handshake + L3 IPv4 packet delivery through `cco_tunnel_start_channel` completes in **`0.42–0.43 s`** (`cargo test -p cco-ffi`), and `.NET 9` xUnit P/Invoke suite (`Cco.Windows.Tests`) completes in **`0.39 s`**.
 - **Security audit (`cargo audit`):** **`0` vulnerabilities** across all `204` Cargo dependencies (including `boringtun 0.7.1`, `ring 0.17.14`, `rusqlite 0.43.0`, `jni 0.21.1`).
+
+---
+
+## 6. Live 4-Node Geo-Distributed WAN Verification (Dual NAT, Docker Compose)
+
+Both architectures were evaluated back-to-back on the **same 4-node geographically distributed WAN testbed** in isolated Docker Compose containers (zero host routing or firewall interference):
+
+- **Topology:** `Node A` (behind residential NAT) `->` `Node X1` (City-1 public relay) `->` `Node X2` (City-2 public relay) `->` `Node B` (City-3 behind NAT router with UDP port forwarding).
+- **Underlay RTT baseline:** `A <-> X1` `8.7 ms`, `X1 <-> X2` `11.1–12.2 ms`, `X2 <-> B` `21.9 ms`, direct `A <-> B` `~23–25 ms`.
+- **Overlay implementation:** 100% Rust binary (`cco`, commits `e8958bb` + `74f84a0`) with authenticated NAT endpoint roaming, `Trust Registry v2`, Ed25519/X25519 MCC capsules (`mode=first`, `x1=2, x2=2`), and host-interface `tcpdump` capture at both endpoints `A` and `B`.
+
+| Metric (Same 4-Node Geo-Distributed WAN, Dual NAT) | Kernel IPsec (`strongSwan 5.9.8` + Rust `cco --ike-proxy`) | Userspace WireGuard (100% Rust `cco wg-tunnel` / `boringtun 0.7.1`) |
+| :--- | :---: | :---: |
+| Control-plane protocol over MCC (`A -> X1 -> X2 -> B`) | IKEv2 (`UDP/500`, `UDP/4500` Non-ESP) | WireGuard `Noise_IKpsk2` (`Type 1/2/3`) |
+| Data-plane protocol direct (`A <-> B`) | Kernel XFRM NAT-T `ESP-in-UDP` (`UDP/4500`, AES-256-CBC / HMAC-SHA2-256) | Userspace `ChaCha20-Poly1305` (`Type 4` `UDP/4500`) |
+| Required container stack / privileges | `strongSwan` + `nftables` (`notrack` ESP-in-UDP) + `CAP_NET_ADMIN` + `CAP_NET_RAW` | Single Rust binary `cco` + `/dev/net/tun` (`CAP_NET_ADMIN`, zero `nftables`) |
+| Initial handshake latency across 2 transit cities | `529.0 ms` (2-RTT `IKE_SA_INIT` + `IKE_AUTH`) | **`128.0 ms`** (**4.1× faster**, 1-RTT `Noise_IKpsk2`) |
+| Direct control-plane leakage (`tcpdump` on hosts `A` & `B`) | **`0`** (`UDP/500 = 0`, `UDP/4500 Non-ESP = 0`) | **`0`** (`Type 1 = 0`, `Type 2 = 0`, `Type 3 = 0`) |
+| Steady-state tunnel ICMP RTT (10 probes, `0%` loss) | `23.38 / 24.46 / 31.63 ms` (`min / avg / max`) | `23.58 / 25.45 / 29.82 ms` (`min / avg / max`, `< 1 ms` delta) |
+| `iperf3` TCP 1-stream `A -> B` (`10 s`, uplink-limited) | `71.9 Mbps` sender / `70.1 Mbps` receiver | `69.7 Mbps` sender / `67.1 Mbps` receiver (`96%` of kernel XFRM) |
+| `iperf3` TCP 4-streams `A -> B` (`10 s`) | `70.8 Mbps` sender / `69.2 Mbps` receiver | **`72.9 Mbps`** sender / **`70.3 Mbps`** receiver (`102%` of kernel XFRM) |
+| `iperf3` TCP 4-streams reverse `B -> A` (`10 s`) | `89.3 Mbps` sender / `86.6 Mbps` receiver | `88.6 Mbps` sender / `86.0 Mbps` receiver (`99.3%` of kernel XFRM) |
+| Total encrypted payload moved across WAN during test | `> 301 MB` (`305,157` ESP packets) | `> 309 MB` (`307,975` WG Type 4 packets) |
+| Live rekey over MCC overlay (under continuous ping) | `CHILD_SA = 275.2 ms`, `IKE_SA = 258.1 ms` (SPI rotated cleanly) | Automatic `120 s` PFS rekey (`Type 1/2` routed `A -> X1 -> X2 -> B`: `72` pkts `A->X1`, `30` pkts `X2->B`) |
+| Packet loss during live rekey | **`0 / 40` (`0.0%` loss)**, RTT avg `23.66 ms` | **`0 / 62` (`0.0%` loss)**, RTT avg `24.60 ms` |
+| Direct control leakage during live rekey (`tcpdump`) | **`0`** (`UDP/500 = 0`, `UDP/4500 Non-ESP = 0`, `80` ESP pkts) | **`0`** (`Type 1/2/3 = 0`, `132` direct Type 4 pkts) |
+
+### Key Engineering Findings Confirmed on Live WAN
+1. **Throughput parity of userspace Rust vs kernel XFRM:** On a ~90 Mbps WAN link, 100% userspace `boringtun` (`ChaCha20-Poly1305`) matches kernel `strongSwan` (`AES-256-CBC` XFRM) within `0.7–4%` (`86.0` vs `86.6 Mbps` downlink; `70.3` vs `69.2 Mbps` 4-stream uplink) while eliminating `strongSwan`, `nftables`, and `CAP_NET_RAW`.
+2. **4.1× faster control-plane convergence over WAN:** Single-RTT WireGuard `Noise_IKpsk2` completes initial establishment across two transit cities in **`128 ms`** vs **`529 ms`** for two-RTT IKEv2 (`IKE_SA_INIT` + `IKE_AUTH`).
+3. **Zero-loss seamless PFS rotation:** Both forced IPsec `CHILD_SA`/`IKE_SA` rekeys (`40/40` pings) and WireGuard's automatic `120 s` PFS rekey (`62/62` pings) rotated session keys strictly through the multi-city MCC overlay with **`0` dropped packets** and **`0` direct control-plane packets** observed on either host interface.
+4. **NAT-T `conntrack` discovery (`74f84a0`):** Live dual-NAT testing uncovered a Linux `conntrack` interaction where `nftables` `nat output` redirects on `UDP/4500` stick subsequent `ESP-in-UDP` packets onto the IKE capture socket; adding `notrack` rules in `output_raw` for non-zero SPI (`@th,64,32 != 0x00000000`) and 1-byte NAT-T keepalives (`udp length 9`) permanently resolved it.
