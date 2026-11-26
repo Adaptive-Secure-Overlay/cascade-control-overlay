@@ -80,3 +80,34 @@ cargo run --release -p cco-cli -- wg-sim --format csv
   - `direct_ike_udp4500_nonesp`: **`0`**
   - `overlay_udp_packets` (port 9000): **`324`**
   - `direct_esp_proto50`: **`10`** (5 Echo Request + 5 Echo Reply)
+
+---
+
+## 5. Live Userspace WireGuard (`boringtun 0.7.1`) vs Kernel `strongSwan` Comparison (`v0.2.0`)
+
+Commands:
+```bash
+# In-memory 4-node split WireGuard E2E (Windows / Linux / macOS)
+cargo test -p cco-wg-tunnel --test split_wg_e2e
+
+# Live Linux kernel /dev/net/tun + ip netns + tcpdump verification
+sudo CCO_BIN=./target/release/cco bash lab/scripts/wg_userspace_e2e.sh
+```
+
+| Metric (4-Node `ip netns` RFC 5737 Lab, Linux 6.6) | Kernel IPsec (`strongSwan 5.9.5` + `cco node`) | Userspace WireGuard (`boringtun 0.7.1` + `cco wg-tunnel`) |
+| :--- | :---: | :---: |
+| Control-plane protocol over MCC (`A -> X1 -> X2 -> B`) | IKEv2 (`IKE_SA_INIT`, `IKE_AUTH`) | WireGuard Handshake (`Type 1/2/3`) |
+| Direct control packets on provider bridge (`provider.pcap`) | **`0`** (`direct_ike_total == 0`) | **`0`** (`type1=0, type2=0, type3=0`) |
+| Unsolicited direct handshake drop guard | `nftables` TPROXY redirect | In-process drop (`direct_handshake_rx_dropped`) |
+| Direct data-plane packets on provider bridge (`provider.pcap`) | `10` (`ESP proto 50`) | `14` (`WG Type 4`, `692 B` tx / `692 B` rx) |
+| Overlay UDP packets on provider bridge (port `9000`) | `324` | `1,735` |
+| Initial overlay handshake latency (`handshake_ms`) | `< 150 ms` | **`105 ms`** |
+| Tunnel ICMP ping (`198.51.100.10 -> 198.51.100.13`, 5 packets) | `5/5` (`0%` loss) | `5/5` (`0%` loss) |
+| Tunnel ICMP RTT (`min / avg / max`) | `0.087 / 0.101 / 0.141 ms` | `0.390 / 0.452 / 0.489 ms` |
+| Desktop / Mobile portability (no root / no unsigned drivers) | Linux routers (`nftables` + `XFRM`) | **Android `VpnService`, Windows `Wintun`, macOS `utun`, Linux TUN** |
+
+### Cross-Platform FFI & GUI Footprint (`v0.2.0` Release Artifacts)
+- **Android (`apps/android`):** stripped `libcco_ffi.so` `arm64-v8a` = **`4.68 MB`**, `x86_64` = **`5.16 MB`**, universal APK = **`19.53 MB`**.
+- **Windows (`apps/windows`):** `cco_ffi.dll` = **`5.26 MB`**, `CcoOverlayWindows.exe` = **`156 KB`**, official signed `wintun.dll` (`WireGuard LLC`, 0.14.1, SHA-256 verified at build time) = **`428 KB`**.
+- **C-ABI & P/Invoke / XCTest roundtrip:** full 4-node split WireGuard handshake + L3 IPv4 packet delivery through `cco_tunnel_start_channel` completes in **`0.42–0.43 s`** (`cargo test -p cco-ffi`), and `.NET 9` xUnit P/Invoke suite (`Cco.Windows.Tests`) completes in **`0.39 s`**.
+- **Security audit (`cargo audit`):** **`0` vulnerabilities** across all `204` Cargo dependencies (including `boringtun 0.7.1`, `ring 0.17.14`, `rusqlite 0.43.0`, `jni 0.21.1`).

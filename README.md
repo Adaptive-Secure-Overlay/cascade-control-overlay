@@ -21,7 +21,7 @@ This repository ports and hardens the research software suite developed within a
 
 ## Workspace Architecture
 
-All crates enforce `#![forbid(unsafe_code)]`, except `cco-linux-proxy`, where `unsafe` is strictly isolated to minimal `libc` socket wrappers under `#[cfg(target_os = "linux")]`. Only vetted RustCrypto / dalek primitives (`x25519-dalek`, `ed25519-dalek`, `hkdf`, `sha2`, `aes-gcm`, `zeroize`, `subtle`) are used; legacy password-based fallbacks are permanently removed.
+All crates enforce `#![forbid(unsafe_code)]`, except `cco-linux-proxy` (minimal Linux socket/TUN wrappers) and the thin C-ABI / JNI boundary files in `cco-ffi` (`cco-ffi/src/core.rs` itself enforces `#![forbid(unsafe_code)]`). Only vetted RustCrypto / dalek / `boringtun` primitives are used; `cargo audit` passes with **0 vulnerabilities** across all dependencies.
 
 | Crate | Purpose | Unsafe Policy |
 | :--- | :--- | :--- |
@@ -29,10 +29,26 @@ All crates enforce `#![forbid(unsafe_code)]`, except `cco-linux-proxy`, where `u
 | [`crates/cco-trust`](crates/cco-trust) | Trust Registry v2 verifier, pinned trust root, strict duplicate-free JSON parser, monotonic anti-rollback store, offline keygen/signing | `#![forbid(unsafe_code)]` |
 | [`crates/cco-proto`](crates/cco-proto) | Wire messages (`MGMT_*`, `MCC_*`, `PRIV_*`, `CASCADE_*`), `LinkFrag` UDP fragmentation (`<= 1200 B`), zero-panic IKEv2 & WireGuard parsers | `#![forbid(unsafe_code)]` |
 | [`crates/cco-cascade`](crates/cco-cascade) | Pure Sans-I/O state machines: MCC (with move-only `LocalDeliveryProof` & SQLite ledger), `UniversalCascade` (`H >= 2`), WireGuard overlay + 27-scenario matrix | `#![forbid(unsafe_code)]` |
-| [`crates/cco-transport`](crates/cco-transport) | Async Tokio UDP peer mesh, 4-step MGMT handshake with overlap window, non-blocking session worker, fail-closed trust gate | `#![forbid(unsafe_code)]` |
-| [`crates/cco-linux-proxy`](crates/cco-linux-proxy) | Linux `IP_TRANSPARENT` / `IP_RECVORIGDSTADDR` / `SO_MARK` / `IP_HDRINCL` capture & raw injection + parameterized `nftables`/`xfrm` generators | Minimal isolated Linux syscalls |
+| [`crates/cco-transport`](crates/cco-transport) | Async Tokio UDP peer mesh, 4-step MGMT handshake with overlap window, `SocketProtector` hook, non-blocking session worker, fail-closed trust gate | `#![forbid(unsafe_code)]` |
+| [`crates/cco-wg-tunnel`](crates/cco-wg-tunnel) | Userspace split WireGuard engine (`boringtun 0.7.1`): WG Type 1/2/3 strictly via MCC overlay, WG Type 4 directly `A <-> B`, TUN abstraction (`ChannelTun` / `UnixFdTun`) | `#![forbid(unsafe_code)]` |
+| [`crates/cco-ffi`](crates/cco-ffi) | Unified panic-safe C-ABI (`include/cco_ffi.h`) and native Android JNI (`NativeBridge`) facade powering all GUI clients | Core `#![forbid(unsafe_code)]`; isolated FFI boundary |
+| [`crates/cco-linux-proxy`](crates/cco-linux-proxy) | Linux `IP_TRANSPARENT` / `IP_RECVORIGDSTADDR` / `SO_MARK` / `IP_HDRINCL` capture & raw injection, `/dev/net/tun` helper, parameterized `nftables`/`xfrm` generators | Minimal isolated Linux syscalls |
 | [`crates/cco-analytics`](crates/cco-analytics) | Exact `BigUint` route combinatorics (`F1`/`I2P`/`F3`/`F4`), `n50` threshold, `rayon` Monte Carlo simulator, X25519 vs RSA-3072 benchmark | `#![forbid(unsafe_code)]` |
-| [`crates/cco-cli`](crates/cco-cli) | Unified `cco` binary (`node`, `trust-admin`, `wg-sim`, `analytics`, `bench`, `render-firewall`) | `#![forbid(unsafe_code)]` |
+| [`crates/cco-cli`](crates/cco-cli) | Unified `cco` binary (`node`, `wg-tunnel`, `wg-keygen`, `trust-admin`, `wg-sim`, `analytics`, `bench`, `render-firewall`) | `#![forbid(unsafe_code)]` |
+
+---
+
+## Cross-Platform GUI Clients (`v0.2.0`)
+
+All desktop and mobile clients share the **single Rust engine (`cco-wg-tunnel` + `cco-ffi`)** — zero Go rewrites and zero unsigned kernel drivers:
+
+| Platform | Location | Stack & OS Tunnel Backend | Verification |
+| :--- | :--- | :--- | :--- |
+| **Android** | [`apps/android`](apps/android) | Kotlin + Jetpack Compose (Material 3) + rootless `VpnService` (`protect(fd)` + `detachFd()`) + `libcco_ffi.so` (`arm64-v8a`, `x86_64`) | JVM unit tests + universal APK (`19.53 MB`) in CI (`android-build`) |
+| **Windows** | [`apps/windows`](apps/windows) | C# `.NET 9` WPF + P/Invoke (`cco_ffi.dll`) + SHA-256 verified official signed `wintun.dll` 0.14.1 (`WireGuard LLC`) | xUnit P/Invoke integration suite + WPF build in CI (`windows-gui-build`) |
+| **macOS** | [`apps/macos`](apps/macos) | SwiftUI (SwiftPM) + static `libcco_ffi.a` (`CCcoFfi`) + `utun` & `NEPacketTunnelProvider` adapters | `swift test` (XCTest) + `CcoMacApp.app` packaging in CI (`macos-gui-build`) |
+
+Each client provides three views: **Tunnel** (Ed25519 Trust Registry v2 verification + MCC mode/fanout controls), **Telemetry & Proof** (live `direct_handshake_tx == 0` invariant badge, overlay/direct counters, `X2`-hidden status, sanitized events), and **Research Analytics** (interactive Chapter 3 combinatorics & `rayon` Monte Carlo).
 
 ---
 
@@ -78,10 +94,11 @@ No multi-gigabyte VM image is required to reproduce all experiments:
 ### Highlighted Measurements
 
 - **Live L3 strongSwan verification (`ip netns`, Linux 6.6 + strongSwan 5.9.5):** `IKE_SA_INIT` (462/470 B) and `IKE_AUTH` (288/224 B) established `CHILD_SA` tunnel through `A -> X1 -> X2 -> B` with **`direct_ike_total == 0`**, **`overlay_udp_packets == 324`**, **`direct_esp_proto50 == 10`**, and **5/5 ICMP replies (0% loss, 0.101 ms avg RTT)**.
+- **Live L3 userspace WireGuard verification (`lab/scripts/wg_userspace_e2e.sh`, `boringtun 0.7.1`):** `WG Type 1/2/3` handshake completed via MCC overlay in **`105 ms`** with **`direct_wg_control_total == 0`**, **`direct_wg_type4_data == 14`**, **`overlay_udp_packets == 1735`**, and **5/5 ICMP replies (0% loss, 0.452 ms avg RTT)**.
 - **Monte Carlo speedup (`800,000` trials, `n=10, m=2, j=3`):** **1.79 ms** in Rust (`rayon`) vs **1996.76 ms** in Python (**> 1,100× faster**), matching exact analytics within `<= 0.0004`.
 - **Control-plane crypto (Table 4.6, 1024 B payload):** `X25519 + HKDF-SHA256 + AES-128-GCM` roundtrip **75.0 µs** vs `RSA-3072 OAEP + AES-128-GCM` **2505.7 µs** (**33.4× speedup**).
 
-See [docs/BENCHMARKS.md](docs/BENCHMARKS.md) for full methodology and raw numbers.
+See [docs/BENCHMARKS.md](docs/BENCHMARKS.md) and [docs/SCOPUS-EXPERIMENT-PLAN.md](docs/SCOPUS-EXPERIMENT-PLAN.md) for full methodology and raw numbers.
 
 ---
 
@@ -100,7 +117,8 @@ See [SECURITY.md](SECURITY.md) and [docs/THREAT-MODEL.md](docs/THREAT-MODEL.md) 
 - [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) — System architecture, Sans-I/O separation, and crate dependencies
 - [docs/PROTOCOL.md](docs/PROTOCOL.md) — Exact wire framing, `LinkFrag`, KDF/AAD contexts, and Trust Registry v2 specification
 - [docs/THREAT-MODEL.md](docs/THREAT-MODEL.md) — Adversary assumptions, security invariants, and explicit limitations
-- [docs/BENCHMARKS.md](docs/BENCHMARKS.md) — Python vs Rust measurements, Table 4.6 crypto comparison, and Monte Carlo verification
+- [docs/BENCHMARKS.md](docs/BENCHMARKS.md) — Python vs Rust measurements, Table 4.6 crypto comparison, userspace WG vs kernel strongSwan, and Monte Carlo verification
+- [docs/SCOPUS-EXPERIMENT-PLAN.md](docs/SCOPUS-EXPERIMENT-PLAN.md) — Follow-up journal study protocol (userspace vs kernel split-plane evaluation across Linux, Android, Windows, and macOS)
 - [docs/REPRODUCING-LAB.md](docs/REPRODUCING-LAB.md) — Step-by-step L1/L2/L3/L4 reproduction guide
 
 ## Related Repositories (`Adaptive-Secure-Overlay`)

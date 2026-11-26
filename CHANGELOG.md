@@ -2,6 +2,18 @@
 
 All notable changes to `cascade-control-overlay` are documented in this file.
 
+## [0.2.0] - 2026-11-26
+
+### Added
+- **Userspace Split WireGuard Engine (`cco-wg-tunnel`):** `#![forbid(unsafe_code)]` in-process userspace WireGuard tunnel powered by Cloudflare's `boringtun 0.7.1` with strict architectural split: `WG Type 1/2/3` handshakes traverse the MCC overlay (`A -> X1 -> X2 -> B`, Ed25519/X25519/SQLite anti-replay) while `WG Type 4` encrypted transport packets flow directly (`A <-> B`), and unsolicited direct handshakes are dropped fail-closed.
+- **RFC WireGuard Framing & Linux TUN Support (`cco-proto`, `cco-cascade`, `cco-linux-proxy`, `cco-cli`):** Added `parse_wireguard_packet_rfc` (WireGuard spec Section 5.4.6 unpadded Type 4 compatibility), MCC support for WireGuard control handshakes (`WG_OVERLAY_CONTROL_PORT = 51820`), `SocketProtector` hook in `cco-transport` for Android `VpnService.protect(fd)`, `/dev/net/tun` helper in `cco-linux-proxy`, and `cco wg-keygen` / `cco wg-tunnel` CLI subcommands.
+- **Live Userspace WireGuard L3 Verification (`lab/scripts/wg_userspace_e2e.sh`):** 4-node Linux `ip netns` + `/dev/net/tun` + `tcpdump` verification proving `direct_wg_control_total == 0`, `direct_wg_type4_data > 0`, `handshake_ms = 105 ms`, and 5/5 ICMP replies (`0.452 ms` avg RTT), automated in CI (`wg-userspace-l3-live`).
+- **Unified Cross-Platform FFI (`cco-ffi`):** Panic-safe C-ABI (`include/cco_ffi.h`, `cdylib` + `staticlib`) for Windows C# and macOS Swift, plus native Android JNI (`org.adaptivesecureoverlay.cco.NativeBridge`) with direct `VpnService.protect(fd)` callback and 4-node C-ABI E2E tests (`ffi_roundtrip`).
+- **Android Material 3 Client (`apps/android`):** Rootless Kotlin + Jetpack Compose client with native `VpnService`, `libcco_ffi.so` (`arm64-v8a` + `x86_64`), 3 tabs (Tunnel, Telemetry & Proof, Chapter 3 Research Analytics), JVM unit tests, and automated CI APK build (`android-build`).
+- **Windows `.NET 9` WPF Client (`apps/windows`):** Clean open-source C# WPF desktop client with P/Invoke bindings to `cco_ffi.dll`, SHA-256 verified official signed `wintun.dll` 0.14.1 (`scripts/fetch-wintun.ps1`), xUnit P/Invoke integration suite, and CI build (`windows-gui-build`).
+- **macOS SwiftUI Client (`apps/macos`):** Swift Package Manager SwiftUI client statically linked against `libcco_ffi.a` via C-ABI (`CCcoFfi`), native `utun` and `NEPacketTunnelProvider` adapters, XCTest integration suite, and `macos-latest` CI build (`macos-gui-build`).
+- **Release Pipeline & Scopus Research Plan:** Extended `.github/workflows/release.yml` to publish Android APK, Windows WPF ZIP, and macOS `.app` bundle alongside CLI binaries and `SHA256SUMS.txt`; added `docs/SCOPUS-EXPERIMENT-PLAN.md` and userspace-vs-kernel benchmark tables in `docs/BENCHMARKS.md`.
+
 ## [0.1.1] - 2026-11-26
 
 ### Changed & Fixed

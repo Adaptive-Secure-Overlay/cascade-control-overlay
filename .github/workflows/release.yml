@@ -14,7 +14,7 @@ env:
 
 jobs:
   build:
-    name: Build ${{ matrix.asset_name }}
+    name: Build CLI (${{ matrix.asset_name }})
     strategy:
       fail-fast: false
       matrix:
@@ -89,9 +89,95 @@ jobs:
           name: ${{ matrix.asset_name }}
           path: dist/${{ matrix.asset_name }}.${{ matrix.archive }}
 
+  build-android-gui:
+    name: Build Android APK (arm64-v8a + x86_64)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-linux-android, x86_64-linux-android
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: release-android-jni
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "21"
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: "8.9"
+      - name: Cross-compile libcco_ffi.so
+        env:
+          ANDROID_NDK_HOME: ${{ env.ANDROID_NDK_LATEST_HOME }}
+        run: |
+          chmod +x apps/android/scripts/build_jni_libs.sh
+          bash apps/android/scripts/build_jni_libs.sh
+      - name: Test and package Android universal APK
+        run: |
+          (cd apps/android && gradle :app:testDebugUnitTest :app:assembleDebug --stacktrace)
+          mkdir -p dist
+          cp apps/android/app/build/outputs/apk/debug/app-debug.apk dist/cco-android-universal.apk
+          ls -lh dist/cco-android-universal.apk
+      - uses: actions/upload-artifact@v4
+        with:
+          name: cco-android-universal
+          path: dist/cco-android-universal.apk
+
+  build-windows-gui:
+    name: Build Windows WPF GUI (cco_ffi.dll + Wintun)
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: release-windows-gui
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: "9.0.x"
+      - name: Build cco_ffi.dll, verify Wintun 0.14.1, test, and package WPF ZIP
+        shell: pwsh
+        run: |
+          cargo build --release --locked -p cco-ffi
+          New-Item -ItemType Directory -Force apps/windows/native | Out-Null
+          Copy-Item target/release/cco_ffi.dll apps/windows/native/cco_ffi.dll -Force
+          ./apps/windows/scripts/fetch-wintun.ps1
+          dotnet test apps/windows/Cco.Windows.sln -c Release
+          dotnet publish apps/windows/src/Cco.Windows.App/Cco.Windows.App.csproj -c Release -r win-x64 --self-contained false -o dist/windows-gui
+          Copy-Item README.md, README.ru.md, LICENSE-MIT, LICENSE-APACHE dist/windows-gui/
+          Compress-Archive -Path "dist/windows-gui/*" -DestinationPath "dist/cco-windows-gui-x86_64.zip" -Force
+          Get-Item "dist/cco-windows-gui-x86_64.zip" | Select-Object Name, Length
+      - uses: actions/upload-artifact@v4
+        with:
+          name: cco-windows-gui-x86_64
+          path: dist/cco-windows-gui-x86_64.zip
+
+  build-macos-gui:
+    name: Build macOS SwiftUI GUI (libcco_ffi.a)
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: release-macos-gui
+      - name: Build libcco_ffi.a, test XCTest, and package CcoMacApp.app
+        run: |
+          chmod +x apps/macos/scripts/build_macos.sh
+          bash apps/macos/scripts/build_macos.sh
+          mkdir -p dist
+          cp README.md README.ru.md LICENSE-MIT LICENSE-APACHE apps/macos/dist/
+          tar -C apps/macos/dist -czf dist/cco-macos-gui-aarch64.tar.gz CcoMacApp.app README.md README.ru.md LICENSE-MIT LICENSE-APACHE
+          ls -lh dist/cco-macos-gui-aarch64.tar.gz
+      - uses: actions/upload-artifact@v4
+        with:
+          name: cco-macos-gui-aarch64
+          path: dist/cco-macos-gui-aarch64.tar.gz
+
   publish:
     name: Publish GitHub Release
-    needs: build
+    needs: [build, build-android-gui, build-windows-gui, build-macos-gui]
     if: startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-latest
     steps:

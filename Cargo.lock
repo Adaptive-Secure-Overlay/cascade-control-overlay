@@ -181,7 +181,7 @@ dependencies = [
 
 [[package]]
 name = "cco-analytics"
-version = "0.1.1"
+version = "0.2.0"
 dependencies = [
  "cco-crypto",
  "num-bigint",
@@ -196,7 +196,7 @@ dependencies = [
 
 [[package]]
 name = "cco-cascade"
-version = "0.1.1"
+version = "0.2.0"
 dependencies = [
  "base64",
  "cco-crypto",
@@ -214,7 +214,7 @@ dependencies = [
 
 [[package]]
 name = "cco-cli"
-version = "0.1.1"
+version = "0.2.0"
 dependencies = [
  "cco-analytics",
  "cco-cascade",
@@ -236,7 +236,7 @@ dependencies = [
 
 [[package]]
 name = "cco-crypto"
-version = "0.1.1"
+version = "0.2.0"
 dependencies = [
  "aes-gcm",
  "ed25519-dalek",
@@ -252,7 +252,7 @@ dependencies = [
 
 [[package]]
 name = "cco-ffi"
-version = "0.1.1"
+version = "0.2.0"
 dependencies = [
  "cco-analytics",
  "cco-cascade",
@@ -272,7 +272,7 @@ dependencies = [
 
 [[package]]
 name = "cco-linux-proxy"
-version = "0.1.1"
+version = "0.2.0"
 dependencies = [
  "cco-cascade",
  "cco-proto",
@@ -287,7 +287,7 @@ dependencies = [
 
 [[package]]
 name = "cco-proto"
-version = "0.1.1"
+version = "0.2.0"
 dependencies = [
  "base64",
  "cco-crypto",
@@ -299,7 +299,7 @@ dependencies = [
 
 [[package]]
 name = "cco-transport"
-version = "0.1.1"
+version = "0.2.0"
 dependencies = [
  "cco-cascade",
  "cco-crypto",
@@ -317,7 +317,7 @@ dependencies = [
 
 [[package]]
 name = "cco-trust"
-version = "0.1.1"
+version = "0.2.0"
 dependencies = [
  "base64",
  "cco-crypto",
@@ -331,7 +331,7 @@ dependencies = [
 
 [[package]]
 name = "cco-wg-tunnel"
-version = "0.1.1"
+version = "0.2.0"
 dependencies = [
  "boringtun",
  "cco-cascade",

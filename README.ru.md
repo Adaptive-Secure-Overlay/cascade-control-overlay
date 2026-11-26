@@ -34,9 +34,9 @@
 
 ---
 
-## Архитектура Cargo Workspace
+## Архитектура Cargo Workspace и кроссплатформенных GUI-клиентов (`v0.2.0`)
 
-Во всех крейтах действует `#![forbid(unsafe_code)]`, кроме `cco-linux-proxy`, где `unsafe` изолирован в минимальных Linux syscall-обертках (`setsockopt`, `recvmsg`, `sendto`). Используется только проверенная криптография RustCrypto/dalek с `Zeroize`/`ZeroizeOnDrop`.
+Во всех крейтах действует `#![forbid(unsafe_code)]`, кроме минимальных Linux syscall-оберток в `cco-linux-proxy` и тонкой FFI-границы в `cco-ffi` (ядро `cco-ffi/src/core.rs` также защищено `#![forbid(unsafe_code)]`). Все мобильные и настольные клиенты работают поверх **единого Rust-ядра** без переписывания на Go и без неподписанных драйверов ядра (`cargo audit`: 0 уязвимостей).
 
 ```text
 cascade-control-overlay/
@@ -45,13 +45,19 @@ cascade-control-overlay/
 │   ├── cco-trust/         # Trust Registry v2 (pinned root, anti-rollback, atomic store)
 │   ├── cco-proto/         # Wire-сообщения, LinkFrag (<= 1200 B), парсеры IKEv2 и WireGuard
 │   ├── cco-cascade/       # Sans-I/O ядро: MCC + SQLite ledger, UniversalCascade, WG 27-matrix
-│   ├── cco-transport/     # Async Tokio UDP mesh, 4-шаговый MGMT, неблокирующий воркер сессий
-│   ├── cco-linux-proxy/   # Linux TPROXY / SO_MARK / RAW inject + генератор nftables/xfrm
+│   ├── cco-transport/     # Async Tokio UDP mesh, 4-шаговый MGMT, SocketProtector, воркер сессий
+│   ├── cco-wg-tunnel/     # Userspace WireGuard (boringtun 0.7.1): WG 1/2/3 через MCC, WG 4 напрямую
+│   ├── cco-ffi/           # Единый C-ABI (include/cco_ffi.h) + нативный Android JNI (NativeBridge)
+│   ├── cco-linux-proxy/   # Linux TPROXY / SO_MARK / RAW inject / /dev/net/tun + генератор nftables/xfrm
 │   ├── cco-analytics/     # Комбинаторика Главы 3, n50, rayon Монте-Карло, бенчмарк Таблицы 4.6
-│   └── cco-cli/           # Единый CLI-бинарник `cco`
-├── lab/                   # Легкий Docker (~200 МБ) и автономный Linux ip netns стенд strongSwan
+│   └── cco-cli/           # Единый CLI-бинарник `cco` (`node`, `wg-tunnel`, `wg-keygen`, ...)
+├── apps/
+│   ├── android/           # Kotlin + Material 3 + нативный VpnService (без root) + libcco_ffi.so
+│   ├── windows/           # Открытый C# .NET 9 WPF + cco_ffi.dll + подписанный wintun.dll (SHA-256)
+│   └── macos/             # SwiftUI (SwiftPM) + libcco_ffi.a + utun / NEPacketTunnelProvider
+├── lab/                   # Docker (~200 МБ) и автономные Linux ip netns стенды (strongSwan + userspace WG)
 ├── examples/              # Безопасные примеры конфигураций (только RFC 5737)
-└── docs/                  # Архитектура, спецификация протокола, модель угроз, бенчмарки
+└── docs/                  # Архитектура, протокол, модель угроз, бенчмарки и план статьи Scopus
 ```
 
 ---
@@ -81,17 +87,21 @@ cargo run --release -p cco-cli -- bench crypto --iters 200 --rsa-iters 20 --incl
 cargo run --release -p cco-cli -- wg-sim --format csv
 ```
 
-### Живая L3-проверка со strongSwan на Linux / WSL2 (без создания ВМ EVE-NG)
+### Живая L3-проверка на Linux / WSL2 (strongSwan и userspace WireGuard)
 
 ```bash
 cargo build --release -p cco-cli
+# 1. Ядерный IPsec / strongSwan (IKEv2 через MCC, ESP напрямую)
 sudo CCO_BIN=./target/release/cco bash lab/scripts/netns_e2e.sh
+# 2. Userspace WireGuard boringtun (WG Type 1/2/3 через MCC, WG Type 4 напрямую)
+sudo CCO_BIN=./target/release/cco bash lab/scripts/wg_userspace_e2e.sh
 ```
 
-Скрипт поднимает 5 изолированных сетевых пространств имен Linux (`cco-isp` с мостом `cco-br0` и `tcpdump`, `cco-A`, `cco-X1`, `cco-X2`, `cco-B`), применяет правила `nftables`/`xfrm`, запускает 4 узла `cco node` и два немодифицированных демона `strongSwan charon`, устанавливает IPsec-туннель `198.51.100.10/32 <-> 198.51.100.13/32`, прогоняет ICMP-трафик и автоматически проверяет pcap:
-- `direct_ike_total == 0` (ноль прямых пакетов IKEv2 между `A` и `B` на мосту провайдера);
-- `overlay_udp_packets > 0` (324 пакета защищенного оверлея на UDP/9000);
-- `direct_esp_proto50 == 10` (прямой IPsec ESP, 5/5 ICMP-ответов, 0% потерь).
+Оба стенда поднимают 5 изолированных сетевых пространств имен Linux (`cco-isp` с мостом и `tcpdump`, `cco-A`, `cco-X1`, `cco-X2`, `cco-B`), прогоняют ICMP-трафик через `198.51.100.10 <-> 198.51.100.13` и автоматически проверяют pcap:
+- **strongSwan (`netns_e2e.sh`):** `direct_ike_total == 0`, `overlay_udp_packets == 324`, `direct_esp_proto50 == 10`, `5/5` ICMP-ответов (0% потерь, средний RTT `0.101 ms`);
+- **userspace WireGuard (`wg_userspace_e2e.sh`):** `direct_wg_control_total == 0`, `direct_wg_type4_data == 14`, `overlay_udp_packets == 1735`, время рукопожатия через MCC `105 ms`, `5/5` ICMP-ответов (0% потерь, средний RTT `0.452 ms`).
+
+Подробные таблицы замеров и план продолжения экспериментов для журнальной статьи: [docs/BENCHMARKS.md](docs/BENCHMARKS.md) и [docs/SCOPUS-EXPERIMENT-PLAN.md](docs/SCOPUS-EXPERIMENT-PLAN.md).
 
 ---
 
