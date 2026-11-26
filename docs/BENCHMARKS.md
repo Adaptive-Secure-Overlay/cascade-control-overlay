@@ -220,3 +220,22 @@ Confirmed on Linux `6.6` (`WSL2`) with unmodified `strongSwan 5.9.5` + `nftables
 ### Key Takeaways (`UniversalCascade` `m`-Hop Scaling)
 1. **Linear `O(K * m)` message budget vs exponential `O(2^m)` fanout:** With `K = 2` parallel chains, going from `m = 2` to `m = 10` (5× deeper cascade) grows `F4` cascade messages linearly (`44.7 -> 105.3` for IKEv2, `38.7 -> 82.0` for WireGuard) and keeps localhost handshake time under `10.5 ms` (IKEv2) / `7.34 ms` (WireGuard), while total RAM for all 14 live nodes stays `14–22 MiB` (`~1.0–1.6 MiB/node`).
 2. **Why `F4` outperforms `F3` both in security and latency at high `m/n`:** Under `n = 14`, `m = 10`, `F3` has only 12 distinct relays available and must reject/backtrack locally on random collisions without transmitting a `visited` list, increasing median setup time (`22.68 ms` vs `10.47 ms` for IKEv2; `16.85 ms` vs `7.34 ms` for WireGuard). Meanwhile `F4` simultaneously lowers the route compromise probability for `j = 2` compromised relays from `98.48%` (`F1`) and `93.57%` (`F3`) down to **`81.43%`** (`-17.05` pp vs `F1`), raises route entropy to **`36.90 bits`**, and works seamlessly even on the existing 4-node `{A, X1, X2, B}` lab for `m = 3, 5, 10`.
+
+### 7.3 Live 4-Node Geo-Distributed WAN Verification (`m = 3, 5, 10`, Model `F4`, `K = 2`, Dual NAT)
+
+Validated on the exact same 4-node geo-distributed Dual-NAT WAN testbed from Section 6 (`Node A` behind residential NAT -> `Node X1` City-1 -> `Node X2` City-2 -> `Node B` City-3 behind port-forwarded NAT) with constant `3,584 B` padded `CASCADE_*` framing and `tcpdump` audits at both endpoints:
+
+| Live WAN Profile (`F4`, `K = 2`) | `m` (Hops) | Handshake Latency | Tunnel ICMP RTT (`0%` loss) | `iperf3` 4-Stream TCP (`A->B` / `B->A`, recv) | Direct Control Leakage (`tcpdump` A & B) | Endpoint Peak RAM (`VmHWM`) |
+| :--- | :---: | :---: | :---: | :---: | :---: | :---: |
+| Userspace WireGuard (`boringtun`) | `2` (`mcc2`) | `128 ms` | `25.45 ms` | `70.3 / 86.0 Mbps` | **`0`** (`T1/T2/T3 = 0`) | `4.94 MiB` |
+| Userspace WireGuard (`cascade F4`) | **`3`** | **`192 ms`** | `23.93 ms` (`10/10`) | — | **`0`** (`T1/T2/T3 = 0`) | `9.09 MiB` |
+| Userspace WireGuard (`cascade F4`) | **`5`** | **`152 ms`** *(1st try; `5.3 s` w/ 1 loss retry)* | `24.58 ms` (`10/10`) | — | **`0`** (`T1/T2/T3 = 0`) | `8.57 MiB` |
+| Userspace WireGuard (`cascade F4`) | **`10`** | **`566 ms`** *(1st try)* | `24.41 ms` (`10/10`) | **`69.2 / 87.3 Mbps`** (`214,207` `Type 4` pkts) | **`0`** (`T1/T2/T3 = 0`) | `8.95 MiB` |
+| Kernel IPsec (`strongSwan`, `--no-preconnect`) | **`3`** | `1,472 ms` (cold) | `24.00 ms` (`5/5`) | — | **`0`** (`ike500=0`, `ov_ab=0`) | `9.24 MiB` |
+| Kernel IPsec (`strongSwan`, `--no-preconnect` + `prerouting_raw`) | **`5`** | **`~185 ms`** (warm 2-RTT) | `0%` loss | — | **`0`** (`ike500=0`, `ike4500=0`, `ov_ab=0`) | `8.67 MiB` |
+| Kernel IPsec (`strongSwan`, `--no-preconnect` + `prerouting_raw`) | **`10`** | 1st RTT (`IKE_SA_INIT`) ok; 2nd RTT hit UDP frag loss | — | — | **`0`** (`ike500=0`, `ike4500=0`, `ov_ab=0`) | `8.50 MiB` |
+
+#### Live WAN Engineering Findings (`m = 3..10` Field Lessons)
+1. **Zero throughput penalty even at `m = 10` hops:** After a `566 ms` 10-hop WireGuard handshake across intermediate relays, direct `Type 4` throughput remained **`69.2 / 87.3 Mbps`** (`214,207` direct `Type 4` packets, `0` direct `Type 1/2/3` on both endpoints) — identical to `m = 2` (`70.3 / 86.0 Mbps`).
+2. **Inbound `ESP-in-UDP` `prerouting_raw notrack` requirement for IPsec:** On Linux responders, inbound direct `ESP-in-UDP` packets populate `conntrack` on `prerouting`, causing subsequent `IKE_AUTH`/`DELETE` responses on `UDP/4500` to bypass `nat output`. Adding `prerouting_raw` `notrack` rules for non-zero SPI (`@th,64,32 != 0x0`) and 1-byte NAT-T keepalives (`udp length 9`) eliminated all `ike4500` leakage (`0` on both endpoints).
+3. **Why 1-RTT WireGuard (`566 ms`) scales better than 2-RTT IPsec at `m = 10` over lossy WAN:** Each constant-size `3,584 B` JSON frame hex-encodes into `~11` `LINK_FRAG` UDP datagrams per hop (`121` datagrams per 10-hop message without hop-by-hop ACK). WireGuard needs 2 messages (`1 RTT`) while IKEv2 needs 4 sequential messages (`2 RTT`, `~484` fragments). Future hardening should switch `LINK_FRAG` payload encoding from hex to binary/base64 (halving fragment count) and add `SESSION_RESET` when a restarted relay receives encrypted frames for an unknown session, plus expose `--no-preconnect` on `cco wg-tunnel`.
