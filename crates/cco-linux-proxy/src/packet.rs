@@ -93,6 +93,7 @@ pub fn render_nftables_rules(config: &IkeProxyConfig) -> String {
     );
     out.push_str("nft -f - <<'NFT'\n");
     out.push_str("add table inet ikeproxy\n");
+    out.push_str("add chain inet ikeproxy prerouting_raw { type filter hook prerouting priority raw; policy accept; }\n");
     out.push_str("add chain inet ikeproxy output_raw { type filter hook output priority raw; policy accept; }\n");
     out.push_str(
         "add chain inet ikeproxy output { type nat hook output priority -100; policy accept; }\n",
@@ -110,8 +111,15 @@ pub fn render_nftables_rules(config: &IkeProxyConfig) -> String {
         let Some(&peer_ip) = config.peer_ips.get(peer_name) else {
             continue;
         };
-        // Keep NAT-T ESP-in-UDP (non-zero SPI) and 1-byte NAT-T keepalives (udp len 9)
-        // untracked so conntrack never sticks them to an earlier IKE_AUTH :4500 redirect!
+        // Keep inbound and outbound NAT-T ESP-in-UDP (non-zero SPI) and 1-byte NAT-T
+        // keepalives (udp len 9) untracked so conntrack never sticks ESP to an earlier
+        // IKE_AUTH :4500 redirect or causes charon's UDP/4500 replies to bypass nat output!
+        out.push_str(&format!(
+            "add rule inet ikeproxy prerouting_raw ip saddr {peer_ip} udp sport 4500 @th,64,32 != 0x00000000 notrack\n"
+        ));
+        out.push_str(&format!(
+            "add rule inet ikeproxy prerouting_raw ip saddr {peer_ip} udp sport 4500 udp length 9 notrack\n"
+        ));
         out.push_str(&format!(
             "add rule inet ikeproxy output_raw ip daddr {peer_ip} udp dport 4500 @th,64,32 != 0x00000000 notrack\n"
         ));

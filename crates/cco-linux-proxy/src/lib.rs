@@ -67,10 +67,26 @@ mod tests {
         .unwrap();
 
         let nft = render_nftables_rules(&cfg);
+        assert!(nft.contains(
+            "add chain inet ikeproxy prerouting_raw { type filter hook prerouting priority raw; policy accept; }"
+        ));
         assert!(nft.contains("priority -100; policy accept;"));
         assert!(nft.contains("meta mark 0x53 notrack"));
-        assert!(nft.contains("udp dport 4500 @th,64,32 != 0x00000000 notrack"));
-        assert!(nft.contains("udp dport 4500 udp length 9 notrack"));
+        for remote_ip in ["192.0.2.2", "192.0.2.3", "192.0.2.4"] {
+            assert!(nft.contains(&format!(
+                "add rule inet ikeproxy prerouting_raw ip saddr {remote_ip} udp sport 4500 @th,64,32 != 0x00000000 notrack"
+            )));
+            assert!(nft.contains(&format!(
+                "add rule inet ikeproxy prerouting_raw ip saddr {remote_ip} udp sport 4500 udp length 9 notrack"
+            )));
+            assert!(nft.contains(&format!(
+                "add rule inet ikeproxy output_raw ip daddr {remote_ip} udp dport 4500 @th,64,32 != 0x00000000 notrack"
+            )));
+            assert!(nft.contains(&format!(
+                "add rule inet ikeproxy output_raw ip daddr {remote_ip} udp dport 4500 udp length 9 notrack"
+            )));
+        }
+        assert!(!nft.contains("ip saddr 192.0.2.1 udp sport 4500"));
         assert!(nft.contains("meta mark 0x53 return"));
         assert!(nft.contains("@th,64,32 0x00000000 redirect to :15202"));
         assert!(nft.contains("ip daddr 192.0.2.2 udp dport 500 redirect to :15102"));
