@@ -25,7 +25,7 @@ use cco_cascade::mcc::{EndpointSecurity, MccFanout, SelectionMode, SelectionPoli
 use cco_cascade::wireguard::{
     format_scenarios_csv, run_canonical_27_eve_results, run_canonical_27_scenarios,
 };
-use cco_crypto::Ed25519SecretKey;
+use cco_crypto::{Ed25519SecretKey, X25519SecretKey};
 use cco_linux_proxy::{
     DEFAULT_CAPTURE_BASE_500, DEFAULT_CAPTURE_BASE_4500, DEFAULT_SOCKET_MARK, IkeProxyConfig,
     LinuxIkeProxy, render_nftables_rules, render_xfrm_bypass_script,
@@ -67,6 +67,15 @@ enum Commands {
         #[arg(long, value_enum, default_value_t = WgSimFormat::Json)]
         format: WgSimFormat,
     },
+
+    /// Generate a WireGuard X25519 keypair (private key written 0600 if --key-out is set).
+    WgKeygen {
+        #[arg(long)]
+        key_out: Option<PathBuf>,
+    },
+
+    /// Run a live userspace WireGuard tunnel splitting control handshakes via MCC and data directly.
+    WgTunnel(WgTunnelArgs),
 
     /// Chapter 3 route combinatorics, compromise probability, n50, and Monte Carlo simulator.
     Analytics {
@@ -190,6 +199,65 @@ struct NodeArgs {
     ike_mark: u32,
 
     /// Allow non-POSIX private key files for local test fixtures (Windows).
+    #[arg(long)]
+    test_fixtures: bool,
+}
+
+#[derive(Parser, Debug)]
+struct WgTunnelArgs {
+    #[arg(long)]
+    name: String,
+    #[arg(long)]
+    peer: String,
+    #[arg(long)]
+    peers: PathBuf,
+    #[arg(long)]
+    bind: Option<SocketAddr>,
+    #[arg(long)]
+    trust_registry: PathBuf,
+    #[arg(long)]
+    trust_root: PathBuf,
+    #[arg(long)]
+    trust_state: Option<PathBuf>,
+    #[arg(long)]
+    trust_backup: Option<PathBuf>,
+    #[arg(long)]
+    signing_key: PathBuf,
+    #[arg(long)]
+    encryption_key: PathBuf,
+    #[arg(long)]
+    replay_db: PathBuf,
+    /// Path to 64-hex WireGuard static X25519 private key file.
+    #[arg(long)]
+    wg_private_key: PathBuf,
+    /// Remote peer 64-hex WireGuard static X25519 public key.
+    #[arg(long)]
+    peer_wg_public_key: String,
+    /// Local UDP socket address for direct WireGuard Type 4 transport data.
+    #[arg(long)]
+    direct_bind: SocketAddr,
+    /// Remote peer UDP socket address for direct WireGuard Type 4 transport data.
+    #[arg(long)]
+    peer_direct_addr: SocketAddr,
+    /// Linux TUN interface name to create/attach (e.g., `cco0`).
+    #[arg(long, default_value = "cco0")]
+    tun_name: String,
+    #[arg(long, value_enum, default_value_t = CliSelectionMode::First)]
+    mode: CliSelectionMode,
+    #[arg(long, default_value_t = 2)]
+    x1_fanout: usize,
+    #[arg(long, default_value_t = 2)]
+    x2_fanout: usize,
+    #[arg(long, default_value_t = 1)]
+    ike_fanout: usize,
+    #[arg(long, default_value_t = 12_000)]
+    deadline_ms: u64,
+    /// Proactively initiate WireGuard Type 1 handshake through the MCC overlay on startup.
+    #[arg(long)]
+    initiate: bool,
+    /// Optional path to periodically write JSON TunnelStats telemetry snapshots.
+    #[arg(long)]
+    stats_out: Option<PathBuf>,
     #[arg(long)]
     test_fixtures: bool,
 }
@@ -377,6 +445,8 @@ async fn run(cli: Cli) -> Result<(), String> {
         Commands::Node(args) => run_node(args).await,
         Commands::TrustAdmin { action } => run_trust_admin(action),
         Commands::WgSim { format } => run_wg_sim(format),
+        Commands::WgKeygen { key_out } => run_wg_keygen(key_out.as_deref()),
+        Commands::WgTunnel(args) => run_wg_tunnel(args).await,
         Commands::Analytics { action } => run_analytics(action),
         Commands::Bench { action } => run_bench(action),
         Commands::RenderFirewall {
@@ -655,6 +725,179 @@ fn run_trust_admin(action: TrustAdminCmd) -> Result<(), String> {
             Ok(())
         }
     }
+}
+
+fn run_wg_keygen(key_out: Option<&Path>) -> Result<(), String> {
+    let sk = X25519SecretKey::generate();
+    let pk_hex = sk.public_key().to_hex();
+    let sk_hex = sk.to_hex_zeroizing();
+    if let Some(path) = key_out {
+        write_exclusive(path, format!("{}\n", *sk_hex).as_bytes(), true)?;
+        println!("{}", json!({ "generated": true, "public_key_hex": pk_hex }));
+    } else {
+        println!(
+            "{}",
+            json!({ "private_key_hex": *sk_hex, "public_key_hex": pk_hex })
+        );
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+async fn run_wg_tunnel(args: WgTunnelArgs) -> Result<(), String> {
+    use cco_crypto::decode_canonical_hex;
+    use cco_wg_tunnel::{SplitWireGuardTunnel, UnixFdTun, WgTunnelConfig};
+    use zeroize::Zeroizing;
+
+    let raw_peers = fs::read(&args.peers).map_err(|_| "peers_file_unavailable".to_owned())?;
+    let peer_list: Vec<PeerEndpoint> =
+        serde_json::from_slice(&raw_peers).map_err(|_| "invalid_peers_json".to_owned())?;
+    let mut peers = BTreeMap::new();
+    for p in peer_list {
+        peers.insert(p.name.clone(), p);
+    }
+    let self_peer = peers
+        .get(&args.name)
+        .ok_or_else(|| "unknown_local_node".to_owned())?;
+    let bind_addr = args.bind.unwrap_or(self_peer.overlay_addr);
+
+    let state_path = args
+        .trust_state
+        .unwrap_or_else(|| PathBuf::from(format!("{}.state.json", args.trust_registry.display())));
+    let backup_path = args.trust_backup.unwrap_or_else(|| {
+        PathBuf::from(format!("{}.last-valid.json", args.trust_registry.display()))
+    });
+
+    let store = TrustRegistryStore::new(
+        &args.trust_registry,
+        &args.trust_root,
+        state_path,
+        backup_path,
+    );
+    let required: Vec<&str> = peers.keys().map(String::as_str).collect();
+    let verified = store.load(required).map_err(|e| e.code().to_owned())?;
+    let reg_status = verified.status();
+
+    let signing = read_ed25519_key_file(&args.signing_key, args.test_fixtures)
+        .map_err(|e| e.code().to_owned())?;
+    let encryption = read_x25519_key_file(&args.encryption_key, args.test_fixtures)
+        .map_err(|e| e.code().to_owned())?;
+    let wg_sk = read_x25519_key_file(&args.wg_private_key, args.test_fixtures)
+        .map_err(|e| e.code().to_owned())?;
+    let peer_wg_pk = decode_canonical_hex::<32>(&args.peer_wg_public_key)
+        .map_err(|_| "invalid_peer_wg_public_key".to_owned())?;
+
+    let now_s = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs() as i64);
+    let security = EndpointSecurity::new(
+        &args.name,
+        verified,
+        signing,
+        encryption,
+        &args.replay_db,
+        now_s,
+    )
+    .map_err(|e| e.code().to_owned())?;
+
+    let mode = match args.mode {
+        CliSelectionMode::First => SelectionMode::First,
+        CliSelectionMode::Window => SelectionMode::Window,
+        CliSelectionMode::Adaptive => SelectionMode::Adaptive,
+        CliSelectionMode::WaitAll => SelectionMode::WaitAll,
+    };
+    let policy = SelectionPolicy {
+        mode,
+        window_ms: 0,
+        deadline_ms: args.deadline_ms,
+        min_copies: 3,
+        quiet_ms: 150,
+    };
+    policy.validate().map_err(|e| e.code().to_owned())?;
+
+    let mut overlay = NodeTransportConfig::new(&args.name, bind_addr, peers);
+    overlay.fanout = MccFanout {
+        x1: args.x1_fanout,
+        x2: args.x2_fanout,
+        ike: args.ike_fanout,
+    };
+    overlay.policy = policy;
+
+    let tun_fd = cco_linux_proxy::open_linux_tun(&args.tun_name).map_err(|e| e.to_string())?;
+    let tun = UnixFdTun::from_owned_fd(tun_fd, false).map_err(|_| "tun_init_failed".to_owned())?;
+
+    let handle = SplitWireGuardTunnel::start(
+        WgTunnelConfig {
+            peer_name: args.peer.clone(),
+            wg_private_key: Zeroizing::new(*wg_sk.to_bytes_zeroizing()),
+            peer_wg_public_key: peer_wg_pk,
+            wg_preshared_key: None,
+            direct_bind_addr: args.direct_bind,
+            peer_direct_addr: args.peer_direct_addr,
+            persistent_keepalive_secs: Some(25),
+            overlay,
+            trust_registry_version: reg_status.version,
+            trust_registry_sha256: reg_status.sha256,
+        },
+        security,
+        tun,
+    )
+    .await
+    .map_err(|e| e.code().to_owned())?;
+
+    println!(
+        "{}",
+        json!({
+            "started": true,
+            "node": args.name,
+            "peer": args.peer,
+            "tun": args.tun_name,
+            "overlay_addr": handle.overlay_local_addr().to_string(),
+            "direct_addr": handle.direct_local_addr().to_string(),
+        })
+    );
+
+    if args.initiate {
+        tokio::time::sleep(std::time::Duration::from_millis(600)).await;
+        let _ = handle.initiate_handshake().await;
+    }
+
+    let stats_path = args.stats_out.clone();
+    let mut ticker = tokio::time::interval(std::time::Duration::from_millis(500));
+    let mut sigterm =
+        tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()).ok();
+    loop {
+        tokio::select! {
+            _ = ticker.tick() => {
+                if let Some(ref p) = stats_path {
+                    if let Ok(bytes) = serde_json::to_vec_pretty(&handle.stats()) {
+                        let _ = fs::write(p, bytes);
+                    }
+                }
+            }
+            _ = tokio::signal::ctrl_c() => break,
+            _ = async {
+                if let Some(ref mut s) = sigterm {
+                    s.recv().await;
+                } else {
+                    std::future::pending::<()>().await;
+                }
+            } => break,
+        }
+    }
+
+    if let Some(ref p) = stats_path {
+        if let Ok(bytes) = serde_json::to_vec_pretty(&handle.stats()) {
+            let _ = fs::write(p, bytes);
+        }
+    }
+    handle.shutdown().await;
+    Ok(())
+}
+
+#[cfg(not(target_os = "linux"))]
+async fn run_wg_tunnel(_args: WgTunnelArgs) -> Result<(), String> {
+    Err("unsupported_platform_use_gui_or_linux_tun".to_owned())
 }
 
 fn run_wg_sim(format: WgSimFormat) -> Result<(), String> {

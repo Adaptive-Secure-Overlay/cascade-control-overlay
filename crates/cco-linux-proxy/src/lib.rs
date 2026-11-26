@@ -13,7 +13,7 @@ pub use config::{
     CaptureSpec, DEFAULT_CAPTURE_BASE_500, DEFAULT_CAPTURE_BASE_4500, DEFAULT_SOCKET_MARK,
     IkeProxyConfig, ProxyError,
 };
-pub use linux_backend::LinuxIkeProxy;
+pub use linux_backend::{LinuxIkeProxy, open_linux_tun};
 pub use packet::{
     build_ipv4_udp_packet, ipv4_header_checksum, render_nftables_rules, render_xfrm_bypass_script,
 };

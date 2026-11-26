@@ -104,6 +104,24 @@ jobs:
           chmod +x lab/scripts/*.sh
           sudo CCO_BIN="$PWD/target/release/cco" bash lab/scripts/netns_e2e.sh
 
+  wg-userspace-l3-live:
+    name: Live Linux netns + Userspace WireGuard (L3)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Install iproute2, tcpdump, and iputils-ping
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends iproute2 tcpdump iputils-ping
+      - name: Build release cco binary
+        run: cargo build --release -p cco-cli
+      - name: Run live 4-node userspace WireGuard split-plane verification
+        run: |
+          chmod +x lab/scripts/*.sh
+          sudo CCO_BIN="$PWD/target/release/cco" bash lab/scripts/wg_userspace_e2e.sh
+
   security-audit:
     name: Cargo Security Audit
     runs-on: ubuntu-latest

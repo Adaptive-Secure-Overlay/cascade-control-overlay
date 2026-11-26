@@ -343,6 +343,56 @@ mod imp {
             Ok(sent as usize)
         }
     }
+
+    /// Opens a Linux L3 TUN interface (`/dev/net/tun` with `IFF_TUN | IFF_NO_PI`) named `ifname`
+    /// and returns its [`OwnedFd`] for safe consumption by `cco-wg-tunnel::UnixFdTun`.
+    #[allow(unsafe_code)]
+    pub fn open_linux_tun(ifname: &str) -> Result<OwnedFd, ProxyError> {
+        use std::ffi::CString;
+
+        const IFF_TUN: libc::c_short = 0x0001;
+        const IFF_NO_PI: libc::c_short = 0x1000;
+        const TUNSETIFF: libc::c_ulong = 0x4004_54ca;
+
+        if ifname.is_empty() || ifname.len() >= libc::IFNAMSIZ || ifname.contains('\0') {
+            return Err(ProxyError::InvalidPacket("invalid_tun_name"));
+        }
+
+        let path = CString::new("/dev/net/tun")
+            .map_err(|_| ProxyError::InvalidPacket("invalid_tun_path"))?;
+        let raw_fd = unsafe { libc::open(path.as_ptr(), libc::O_RDWR | libc::O_CLOEXEC) };
+        if raw_fd < 0 {
+            return Err(ProxyError::Io(std::io::Error::last_os_error()));
+        }
+        let fd = unsafe { OwnedFd::from_raw_fd(raw_fd) };
+
+        #[repr(C)]
+        struct IfReq {
+            ifr_name: [u8; libc::IFNAMSIZ],
+            ifr_flags: libc::c_short,
+            _pad: [u8; 22],
+        }
+
+        let mut ifr = IfReq {
+            ifr_name: [0u8; libc::IFNAMSIZ],
+            ifr_flags: IFF_TUN | IFF_NO_PI,
+            _pad: [0u8; 22],
+        };
+        ifr.ifr_name[..ifname.len()].copy_from_slice(ifname.as_bytes());
+
+        // Use libc::Ioctl cast for compatibility across glibc (c_ulong) and musl (c_int).
+        let rc = unsafe {
+            libc::ioctl(
+                fd.as_raw_fd(),
+                TUNSETIFF as libc::Ioctl,
+                (&mut ifr as *mut IfReq).cast::<libc::c_void>(),
+            )
+        };
+        if rc < 0 {
+            return Err(ProxyError::Io(std::io::Error::last_os_error()));
+        }
+        Ok(fd)
+    }
 }
 
 #[cfg(not(target_os = "linux"))]
@@ -394,6 +444,11 @@ mod imp {
             (IkeInjectionOutcome::Rejected, receipt)
         }
     }
+
+    /// Non-Linux stub returning [`ProxyError::UnsupportedPlatform`].
+    pub fn open_linux_tun(_ifname: &str) -> Result<(), ProxyError> {
+        Err(ProxyError::UnsupportedPlatform)
+    }
 }
 
-pub use imp::LinuxIkeProxy;
+pub use imp::{LinuxIkeProxy, open_linux_tun};
