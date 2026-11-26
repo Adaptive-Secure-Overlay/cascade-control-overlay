@@ -1,0 +1,103 @@
+# Lightweight 4-node (A, X1, X2, B) strongSwan + Cascade Control Overlay lab.
+# Uses RFC 5737 TEST-NET-1 (192.0.2.0/24) inside an isolated Docker bridge network.
+# Run: docker compose -f lab/docker-compose.yml up --build
+
+networks:
+  provider_net:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 192.0.2.0/24
+          gateway: 192.0.2.1
+
+volumes:
+  lab_state:
+
+services:
+  provisioner:
+    build:
+      context: ..
+      dockerfile: lab/Dockerfile
+    entrypoint: ["/bin/bash", "/opt/cco-lab/scripts/docker_provision.sh"]
+    volumes:
+      - lab_state:/state
+
+  node-x1:
+    build:
+      context: ..
+      dockerfile: lab/Dockerfile
+    depends_on:
+      provisioner:
+        condition: service_completed_successfully
+    entrypoint: ["/bin/bash", "/opt/cco-lab/scripts/docker_node.sh", "X1", "relay"]
+    cap_add:
+      - NET_ADMIN
+      - NET_RAW
+    volumes:
+      - lab_state:/state
+    networks:
+      provider_net:
+        ipv4_address: 192.0.2.11
+
+  node-x2:
+    build:
+      context: ..
+      dockerfile: lab/Dockerfile
+    depends_on:
+      provisioner:
+        condition: service_completed_successfully
+    entrypoint: ["/bin/bash", "/opt/cco-lab/scripts/docker_node.sh", "X2", "relay"]
+    cap_add:
+      - NET_ADMIN
+      - NET_RAW
+    volumes:
+      - lab_state:/state
+    networks:
+      provider_net:
+        ipv4_address: 192.0.2.12
+
+  node-b:
+    build:
+      context: ..
+      dockerfile: lab/Dockerfile
+    depends_on:
+      node-x1:
+        condition: service_started
+      node-x2:
+        condition: service_started
+    entrypoint: ["/bin/bash", "/opt/cco-lab/scripts/docker_node.sh", "B", "endpoint"]
+    cap_add:
+      - NET_ADMIN
+      - NET_RAW
+    sysctls:
+      net.ipv4.conf.all.rp_filter: 0
+      net.ipv4.conf.default.rp_filter: 0
+      net.ipv4.conf.all.accept_local: 1
+      net.ipv4.ip_nonlocal_bind: 1
+    volumes:
+      - lab_state:/state
+    networks:
+      provider_net:
+        ipv4_address: 192.0.2.13
+
+  node-a:
+    build:
+      context: ..
+      dockerfile: lab/Dockerfile
+    depends_on:
+      node-b:
+        condition: service_started
+    entrypoint: ["/bin/bash", "/opt/cco-lab/scripts/docker_node.sh", "A", "endpoint"]
+    cap_add:
+      - NET_ADMIN
+      - NET_RAW
+    sysctls:
+      net.ipv4.conf.all.rp_filter: 0
+      net.ipv4.conf.default.rp_filter: 0
+      net.ipv4.conf.all.accept_local: 1
+      net.ipv4.ip_nonlocal_bind: 1
+    volumes:
+      - lab_state:/state
+    networks:
+      provider_net:
+        ipv4_address: 192.0.2.10
