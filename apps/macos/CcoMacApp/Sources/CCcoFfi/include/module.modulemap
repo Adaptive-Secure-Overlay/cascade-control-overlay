@@ -1,0 +1,4 @@
+module CCcoFfi {
+    header "cco_ffi.h"
+    export *
+}

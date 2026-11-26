@@ -179,6 +179,22 @@ jobs:
           name: cco-windows-gui-x86_64
           path: apps/windows/publish
 
+  macos-gui-build:
+    name: macOS SwiftUI Client + libcco_ffi.a + XCTest
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Build libcco_ffi.a, run XCTest, and package CcoMacApp.app
+        run: |
+          chmod +x apps/macos/scripts/build_macos.sh
+          bash apps/macos/scripts/build_macos.sh
+      - uses: actions/upload-artifact@v4
+        with:
+          name: cco-macos-app-bundle
+          path: apps/macos/dist/CcoMacApp.app
+
   security-audit:
     name: Cargo Security Audit
     runs-on: ubuntu-latest
