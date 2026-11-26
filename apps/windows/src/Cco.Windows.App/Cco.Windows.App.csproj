@@ -1,0 +1,24 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <OutputType>WinExe</OutputType>
+    <TargetFramework>net9.0-windows</TargetFramework>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <UseWPF>true</UseWPF>
+    <AssemblyName>CcoOverlayWindows</AssemblyName>
+    <Version>0.2.0</Version>
+    <Product>Cascade Control Overlay</Product>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\Cco.Windows.Core\Cco.Windows.Core.csproj" />
+  </ItemGroup>
+
+  <ItemGroup Condition="Exists('..\..\native\cco_ffi.dll')">
+    <None Include="..\..\native\cco_ffi.dll" CopyToOutputDirectory="PreserveNewest" Link="cco_ffi.dll" />
+  </ItemGroup>
+
+  <ItemGroup Condition="Exists('..\..\native\wintun.dll')">
+    <None Include="..\..\native\wintun.dll" CopyToOutputDirectory="PreserveNewest" Link="wintun.dll" />
+  </ItemGroup>
+</Project>

@@ -1,0 +1,30 @@
+Microsoft Visual Studio Solution File, Format Version 12.00
+# Visual Studio Version 17
+VisualStudioVersion = 17.12.35506.116
+MinimumVisualStudioVersion = 10.0.40219.1
+Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "Cco.Windows.Core", "src\Cco.Windows.Core\Cco.Windows.Core.csproj", "{B5E42E41-5C12-4A43-90C6-230600000001}"
+EndProject
+Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "Cco.Windows.App", "src\Cco.Windows.App\Cco.Windows.App.csproj", "{B5E42E41-5C12-4A43-90C6-230600000002}"
+EndProject
+Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "Cco.Windows.Tests", "tests\Cco.Windows.Tests\Cco.Windows.Tests.csproj", "{B5E42E41-5C12-4A43-90C6-230600000003}"
+EndProject
+Global
+	GlobalSection(SolutionConfigurationPlatforms) = preSolution
+		Debug|Any CPU = Debug|Any CPU
+		Release|Any CPU = Release|Any CPU
+	EndGlobalSection
+	GlobalSection(ProjectConfigurationPlatforms) = postSolution
+		{B5E42E41-5C12-4A43-90C6-230600000001}.Debug|Any CPU.ActiveCfg = Debug|Any CPU
+		{B5E42E41-5C12-4A43-90C6-230600000001}.Debug|Any CPU.Build.0 = Debug|Any CPU
+		{B5E42E41-5C12-4A43-90C6-230600000001}.Release|Any CPU.ActiveCfg = Release|Any CPU
+		{B5E42E41-5C12-4A43-90C6-230600000001}.Release|Any CPU.Build.0 = Release|Any CPU
+		{B5E42E41-5C12-4A43-90C6-230600000002}.Debug|Any CPU.ActiveCfg = Debug|Any CPU
+		{B5E42E41-5C12-4A43-90C6-230600000002}.Debug|Any CPU.Build.0 = Debug|Any CPU
+		{B5E42E41-5C12-4A43-90C6-230600000002}.Release|Any CPU.ActiveCfg = Release|Any CPU
+		{B5E42E41-5C12-4A43-90C6-230600000002}.Release|Any CPU.Build.0 = Release|Any CPU
+		{B5E42E41-5C12-4A43-90C6-230600000003}.Debug|Any CPU.ActiveCfg = Debug|Any CPU
+		{B5E42E41-5C12-4A43-90C6-230600000003}.Debug|Any CPU.Build.0 = Debug|Any CPU
+		{B5E42E41-5C12-4A43-90C6-230600000003}.Release|Any CPU.ActiveCfg = Release|Any CPU
+		{B5E42E41-5C12-4A43-90C6-230600000003}.Release|Any CPU.Build.0 = Release|Any CPU
+	EndGlobalSection
+EndGlobal

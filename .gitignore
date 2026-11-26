@@ -33,5 +33,6 @@ apps/windows/**/bin/
 apps/windows/**/obj/
 apps/windows/.vs/
 apps/windows/native/
+apps/windows/publish/
 apps/macos/**/.build/
 apps/macos/**/.swiftpm/

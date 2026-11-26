@@ -1,0 +1,13 @@
+<Application x:Class="Cco.Windows.App.App"
+             xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+             xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+             StartupUri="MainWindow.xaml">
+    <Application.Resources>
+        <SolidColorBrush x:Key="BgBrush" Color="#0B1120" />
+        <SolidColorBrush x:Key="CardBrush" Color="#111827" />
+        <SolidColorBrush x:Key="CardBorderBrush" Color="#1E293B" />
+        <SolidColorBrush x:Key="AccentBrush" Color="#2DD4BF" />
+        <SolidColorBrush x:Key="TextPrimary" Color="#F8FAFC" />
+        <SolidColorBrush x:Key="TextMuted" Color="#94A3B8" />
+    </Application.Resources>
+</Application>

@@ -152,6 +152,33 @@ jobs:
           name: cco-android-debug-apk
           path: apps/android/app/build/outputs/apk/debug/*.apk
 
+  windows-gui-build:
+    name: Windows WPF Client + cco_ffi.dll + Wintun
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: "9.0.x"
+      - name: Build release cco_ffi.dll and verify official Wintun 0.14.1
+        shell: pwsh
+        run: |
+          cargo build --release -p cco-ffi
+          New-Item -ItemType Directory -Force apps/windows/native | Out-Null
+          Copy-Item target/release/cco_ffi.dll apps/windows/native/cco_ffi.dll -Force
+          ./apps/windows/scripts/fetch-wintun.ps1
+      - name: Run .NET 9 P/Invoke integration tests and build WPF app
+        shell: pwsh
+        run: |
+          dotnet test apps/windows/Cco.Windows.sln -c Release --verbosity normal
+          dotnet publish apps/windows/src/Cco.Windows.App/Cco.Windows.App.csproj -c Release -r win-x64 --self-contained false -o apps/windows/publish
+      - uses: actions/upload-artifact@v4
+        with:
+          name: cco-windows-gui-x86_64
+          path: apps/windows/publish
+
   security-audit:
     name: Cargo Security Audit
     runs-on: ubuntu-latest
