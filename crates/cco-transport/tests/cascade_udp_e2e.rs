@@ -391,9 +391,219 @@ async fn live_udp_four_node_f4_ikev2_m_3_5_10_with_repeats() {
             "4-node F4 hops={hops}: total active cells across X1+X2 must equal {hops}"
         );
 
+        let total_cascade_tx: u64 = handles.values().map(|h| h.counters().cascade_msgs_tx).sum();
+        let total_ack_tx: u64 = handles.values().map(|h| h.counters().hop_ack_tx).sum();
+        let total_ack_rx: u64 = handles.values().map(|h| h.counters().hop_ack_rx).sum();
+        assert!(total_cascade_tx > 0);
+        assert!(
+            total_ack_tx > 0 && total_ack_rx > 0,
+            "compact cascade frames must exchange authenticated hop-by-hop ACKs"
+        );
+
         for h in handles.values() {
             h.shutdown().await;
         }
+    }
+}
+
+#[tokio::test]
+async fn compact_cascade_four_frags_and_hop_retry_recovers_from_dropped_udp_fragment() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use tokio::net::UdpSocket;
+
+    let dir = TempDir::new().unwrap();
+    let names = vec![
+        "A".to_owned(),
+        "X1".to_owned(),
+        "X2".to_owned(),
+        "B".to_owned(),
+    ];
+
+    let root_sk = Ed25519SecretKey::generate();
+    let mut signers = BTreeMap::new();
+    signers.insert("retry-root".to_owned(), root_sk.public_key());
+    let root_path = dir.path().join("root.json");
+    fs::write(&root_path, build_trust_root_bytes(&signers).unwrap()).unwrap();
+
+    // 4 node overlay ports + 1 lossy proxy port sitting in front of X2
+    let ports = pick_free_udp_ports(5);
+    let proxy_addr = SocketAddr::from(([127, 0, 0, 1], ports[4]));
+    let real_x2_addr = SocketAddr::from(([127, 0, 0, 1], ports[2]));
+    let real_x1_addr = SocketAddr::from(([127, 0, 0, 1], ports[1]));
+
+    let mut signing = BTreeMap::new();
+    let mut encryption = BTreeMap::new();
+    let mut records = BTreeMap::new();
+    let mut base_peers = BTreeMap::new();
+
+    for (idx, name) in names.iter().enumerate() {
+        let esk = Ed25519SecretKey::generate();
+        let xsk = X25519SecretKey::generate();
+        records.insert(
+            name.clone(),
+            NodeKeyRecord {
+                encryption: xsk.public_key(),
+                verification: esk.public_key(),
+                key_id: esk.public_key().key_id(),
+                revoked: false,
+            },
+        );
+        signing.insert(name.clone(), esk);
+        encryption.insert(name.clone(), xsk);
+        base_peers.insert(
+            name.clone(),
+            PeerEndpoint {
+                name: name.clone(),
+                overlay_addr: SocketAddr::from(([127, 0, 0, 1], ports[idx])),
+                underlay_ip: Ipv4Addr::new(192, 0, 2, (60 + idx) as u8),
+            },
+        );
+    }
+
+    let reg_bytes = sign_registry_v2(1, &records, "retry-root", &root_sk).unwrap();
+    let verified = verify_registry_bytes(
+        &reg_bytes,
+        &root_path,
+        names.iter().map(String::as_str),
+        VerifyConstraints::default(),
+    )
+    .unwrap();
+    let now_s = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_secs() as i64;
+
+    // Transparent lossy UDP proxy between X1 <-> X2: passes MGMT unchanged, intentionally
+    // drops the first 2 compact binary fragments (`CCO1` kind=0x02) from X1 to X2!
+    let dropped_frags = Arc::new(AtomicUsize::new(0));
+    let proxy_sock = UdpSocket::bind(proxy_addr).await.unwrap();
+    let dropped_clone = Arc::clone(&dropped_frags);
+    let proxy_task = tokio::spawn(async move {
+        let mut buf = vec![0u8; 65_535];
+        while let Ok((n, src)) = proxy_sock.recv_from(&mut buf).await {
+            let pkt = &buf[..n];
+            if src == real_x1_addr {
+                if pkt.len() >= 5
+                    && pkt[..4] == cco_proto::COMPACT_MAGIC
+                    && pkt[4] == cco_proto::COMPACT_KIND_FRAG
+                    && dropped_clone.fetch_add(1, Ordering::Relaxed) < 2
+                {
+                    continue; // Simulate WAN packet loss on the first two fragments!
+                }
+                let _ = proxy_sock.send_to(pkt, real_x2_addr).await;
+            } else if src == real_x2_addr {
+                let _ = proxy_sock.send_to(pkt, real_x1_addr).await;
+            }
+        }
+    });
+
+    let delivered: DeliveredLog = Arc::new(StdMutex::new(Vec::new()));
+    let notify = Arc::new(Notify::new());
+    let mut handles = BTreeMap::new();
+
+    for name in &names {
+        let sec = EndpointSecurity::new(
+            name,
+            verified.clone(),
+            Ed25519SecretKey::from_bytes(*signing[name].to_bytes_zeroizing()),
+            X25519SecretKey::from_bytes(*encryption[name].to_bytes_zeroizing()),
+            dir.path().join(format!("{name}.sqlite")),
+            now_s,
+        )
+        .unwrap();
+        let mut node_peers = base_peers.clone();
+        if name == "X1" {
+            // Route X1 -> X2 traffic through the lossy UDP proxy!
+            node_peers.get_mut("X2").unwrap().overlay_addr = proxy_addr;
+        }
+        let mut cfg = NodeTransportConfig::new(name, base_peers[name].overlay_addr, node_peers);
+        cfg.route_mode = RouteMode::Cascade;
+        cfg.cascade = CascadeTransportConfig {
+            hops: 5,
+            max_hops: 16,
+            hop_model: HopSelectionModel::F4WithRep,
+            // Single chain (K = 1) so ONLY hop-by-hop retry can recover the dropped fragments!
+            parallel_chains: 1,
+            route_ttl_secs: 120.0,
+        };
+        cfg.hop_ack_timeout_ms = 120;
+        cfg.hop_ack_retries = 3;
+        cfg.preconnect = true;
+
+        let slot = Arc::new(StdMutex::new(None));
+        let sink: Arc<dyn IkeSink> = if name == "A" || name == "B" {
+            Arc::new(AutoReplyIkeSink {
+                node_name: name.clone(),
+                delivered: Arc::clone(&delivered),
+                notify: Arc::clone(&notify),
+                handle_slot: Arc::clone(&slot),
+                auto_reply: name == "B",
+            })
+        } else {
+            Arc::new(cco_transport::RelayOnlySink)
+        };
+        let handle = OverlayNode::start(cfg, sec, sink).await.unwrap();
+        if name == "B" {
+            *slot.lock().unwrap() = Some(handle.clone());
+        }
+        handles.insert(name.clone(), handle);
+    }
+
+    // Warm up MGMT sessions (including X1 <-> proxy <-> X2)
+    handles["X1"].ensure_session("X2").await.unwrap();
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    let before_udp: u64 = handles.values().map(|h| h.counters().udp_packets_tx).sum();
+    let before_msgs: u64 = handles.values().map(|h| h.counters().cascade_msgs_tx).sum();
+
+    let spi = [0x44, 0x55, 0x66, 0x77, 0x01, 0x02, 0x03, 0x05];
+    handles["A"]
+        .send_local_ike(
+            "B",
+            build_ikev2(500, IKE_SA_INIT, 0, false, spi, b"lossy-sa-init"),
+            500,
+        )
+        .await
+        .unwrap();
+    wait_deliveries(&delivered, &notify, 2).await;
+
+    handles["A"]
+        .send_local_ike(
+            "B",
+            build_ikev2(500, IKE_AUTH, 1, false, spi, b"lossy-ike-auth"),
+            500,
+        )
+        .await
+        .unwrap();
+    wait_deliveries(&delivered, &notify, 4).await;
+
+    tokio::time::sleep(Duration::from_millis(120)).await;
+    let after_udp: u64 = handles.values().map(|h| h.counters().udp_packets_tx).sum();
+    let after_msgs: u64 = handles.values().map(|h| h.counters().cascade_msgs_tx).sum();
+    let total_retries: u64 = handles.values().map(|h| h.counters().hop_retries_tx).sum();
+    let total_ack_rx: u64 = handles.values().map(|h| h.counters().hop_ack_rx).sum();
+
+    assert!(
+        dropped_frags.load(Ordering::Relaxed) >= 2,
+        "lossy proxy must have dropped >= 2 compact fragments"
+    );
+    assert!(
+        total_retries >= 1,
+        "hop-by-hop retry must have fired to recover dropped fragment (retries={total_retries})"
+    );
+    assert!(total_ack_rx > 0);
+
+    // Even with a retry, average UDP packets per cascade message stays dramatically below old 11!
+    let udp_delta = after_udp - before_udp;
+    let msg_delta = after_msgs - before_msgs;
+    assert!(
+        (udp_delta as f64) / (msg_delta.max(1) as f64) < 6.5,
+        "compact framing must stay near 4 frags + 1 ack per msg (got {udp_delta}/{msg_delta})"
+    );
+
+    proxy_task.abort();
+    for h in handles.values() {
+        h.shutdown().await;
     }
 }
 

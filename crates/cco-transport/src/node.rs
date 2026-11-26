@@ -15,12 +15,14 @@ use cco_cascade::mcc::{
     MccNodeConfig, MccNodeMachine, WG_OVERLAY_CONTROL_PORT,
 };
 use cco_cascade::universal::{CascadeAction, CascadeCounts, RelayKnowledge, UniversalCascade};
-use cco_crypto::{Key256, sha256_hex};
+use cco_crypto::{Key256, random_bytes, sha256_hex};
 use cco_proto::{
-    ErrorEnvelope, IKE_SA_INIT, LinkFragFrame, LinkFragReassembler, MessageType, MgmtAuth,
-    MgmtInit, MgmtInitResp, SecureEnvelope, T_ERROR, T_LINK_FRAG, T_MGMT_AUTH, T_MGMT_AUTH_RESP,
-    T_MGMT_INIT, T_MGMT_INIT_RESP, WireGuardMessageType, fragment_payload, jdump, jload,
-    parse_ikev2_packet, parse_wireguard_packet_rfc,
+    CompactFragReassembler, CompactFrame, CompactHopAckFrame, CompactSecureFrame, ErrorEnvelope,
+    IKE_SA_INIT, LinkFragFrame, LinkFragReassembler, MessageType, MgmtAuth, MgmtInit, MgmtInitResp,
+    SecureEnvelope, T_ERROR, T_LINK_FRAG, T_MGMT_AUTH, T_MGMT_AUTH_RESP, T_MGMT_INIT,
+    T_MGMT_INIT_RESP, WireGuardMessageType, decode_compact_frame, fragment_compact_payload,
+    fragment_payload, is_compact_frame, jdump, jload, parse_ikev2_packet,
+    parse_wireguard_packet_rfc, peek_compact_sender,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
@@ -31,16 +33,37 @@ use tracing::{debug, info, warn};
 use crate::config::{NodeTransportConfig, RouteMode};
 use crate::error::TransportError;
 use crate::mgmt::{
-    InitiatorHandshake, MgmtSession, PendingResponderHandshake, decrypt_link_envelope,
-    encrypt_link_envelope, responder_handle_auth, responder_handle_init,
+    InitiatorHandshake, MgmtSession, PendingResponderHandshake, decrypt_compact_hop_ack,
+    decrypt_compact_link_frame, decrypt_link_envelope, encrypt_compact_hop_ack,
+    encrypt_compact_link_frame, encrypt_link_envelope, responder_handle_auth,
+    responder_handle_init,
 };
 
 const MAX_PENDING_PER_PEER: usize = 512;
 /// Minimum interval between unsolicited MGMT session-recovery handshakes per peer (DoS guard).
 const SESSION_RECOVERY_COOLDOWN: Duration = Duration::from_millis(1_500);
+/// Maximum simultaneous unacknowledged compact `CASCADE_*` hop frames tracked for retry.
+const MAX_PENDING_HOP_ACKS: usize = 256;
+/// Maximum recent `(peer, sid, ack_id)` entries kept for hop-level deduplication.
+const MAX_SEEN_HOP_ACKS: usize = 1024;
+/// Retention TTL for hop-level deduplication entries.
+const SEEN_HOP_ACK_TTL: Duration = Duration::from_secs(15);
 
 type PendingSendMap = HashMap<String, VecDeque<(MessageType, Vec<u8>)>>;
 type PendingInitAuth = (InitiatorHandshake, Key256, oneshot::Sender<bool>);
+type SeenHopAckKey = (String, String, [u8; 8]);
+
+struct PendingHopTx {
+    peer: String,
+    sid: String,
+    ack_id: [u8; 8],
+    mtype: MessageType,
+    payload: Vec<u8>,
+    wire: Vec<u8>,
+    retries_done: u8,
+    max_retries: u8,
+    next_retry_at: tokio::time::Instant,
+}
 
 /// Live UDP and overlay protocol traffic counters for telemetry and benchmarks.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -53,6 +76,12 @@ pub struct TransportCounters {
     pub cascade_msgs_rx: u64,
     pub mcc_msgs_tx: u64,
     pub mcc_msgs_rx: u64,
+    #[serde(default)]
+    pub hop_ack_tx: u64,
+    #[serde(default)]
+    pub hop_ack_rx: u64,
+    #[serde(default)]
+    pub hop_retries_tx: u64,
 }
 
 #[derive(Default)]
@@ -65,6 +94,9 @@ struct AtomicCounters {
     cascade_msgs_rx: AtomicU64,
     mcc_msgs_tx: AtomicU64,
     mcc_msgs_rx: AtomicU64,
+    hop_ack_tx: AtomicU64,
+    hop_ack_rx: AtomicU64,
+    hop_retries_tx: AtomicU64,
 }
 
 impl AtomicCounters {
@@ -78,6 +110,9 @@ impl AtomicCounters {
             cascade_msgs_rx: self.cascade_msgs_rx.load(Ordering::Relaxed),
             mcc_msgs_tx: self.mcc_msgs_tx.load(Ordering::Relaxed),
             mcc_msgs_rx: self.mcc_msgs_rx.load(Ordering::Relaxed),
+            hop_ack_tx: self.hop_ack_tx.load(Ordering::Relaxed),
+            hop_ack_rx: self.hop_ack_rx.load(Ordering::Relaxed),
+            hop_retries_tx: self.hop_retries_tx.load(Ordering::Relaxed),
         }
     }
 }
@@ -86,6 +121,12 @@ impl AtomicCounters {
 struct PeerSessionSlot {
     active: MgmtSession,
     previous: Option<MgmtSession>,
+}
+
+struct CompactDecryptOk {
+    plaintext: Vec<u8>,
+    matched_sid: String,
+    ack_wire: Option<Vec<u8>>,
 }
 
 impl PeerSessionSlot {
@@ -119,6 +160,60 @@ impl PeerSessionSlot {
             }
         }
         Err((TransportError::Protocol("stale_session_id"), false))
+    }
+
+    fn decrypt_compact(
+        &self,
+        self_name: &str,
+        frame: &CompactSecureFrame,
+    ) -> Result<CompactDecryptOk, (TransportError, bool)> {
+        if frame.sid == self.active.sid {
+            let plaintext = decrypt_compact_link_frame(&self.active, self_name, frame)
+                .map_err(|e| (e, true))?;
+            let ack_wire = if frame.ack_id != [0u8; 8] {
+                encrypt_compact_hop_ack(&self.active, self_name, frame.ack_id).ok()
+            } else {
+                None
+            };
+            return Ok(CompactDecryptOk {
+                plaintext,
+                matched_sid: self.active.sid.clone(),
+                ack_wire,
+            });
+        }
+        if let Some(ref prev) = self.previous {
+            if frame.sid == prev.sid {
+                let plaintext =
+                    decrypt_compact_link_frame(prev, self_name, frame).map_err(|e| (e, false))?;
+                let ack_wire = if frame.ack_id != [0u8; 8] {
+                    encrypt_compact_hop_ack(prev, self_name, frame.ack_id).ok()
+                } else {
+                    None
+                };
+                return Ok(CompactDecryptOk {
+                    plaintext,
+                    matched_sid: prev.sid.clone(),
+                    ack_wire,
+                });
+            }
+        }
+        Err((TransportError::Protocol("stale_session_id"), false))
+    }
+
+    fn decrypt_compact_ack(
+        &self,
+        self_name: &str,
+        frame: &CompactHopAckFrame,
+    ) -> Result<[u8; 8], TransportError> {
+        if frame.sid == self.active.sid {
+            return decrypt_compact_hop_ack(&self.active, self_name, frame);
+        }
+        if let Some(ref prev) = self.previous {
+            if frame.sid == prev.sid {
+                return decrypt_compact_hop_ack(prev, self_name, frame);
+            }
+        }
+        Err(TransportError::Protocol("stale_session_id"))
     }
 }
 
@@ -162,7 +257,10 @@ struct SharedTransport {
     inflight_ensure: Mutex<HashMap<String, Arc<Notify>>>,
     session_recovery_last: Mutex<HashMap<String, tokio::time::Instant>>,
     pending_sends: Mutex<PendingSendMap>,
+    pending_hop_acks: Mutex<HashMap<[u8; 8], PendingHopTx>>,
+    seen_hop_acks: Mutex<HashMap<SeenHopAckKey, tokio::time::Instant>>,
     reassembler: Mutex<LinkFragReassembler>,
+    compact_reassembler: Mutex<CompactFragReassembler>,
     machine: Mutex<MccNodeMachine>,
     cascade: Mutex<UniversalCascade>,
     sink: Arc<dyn IkeSink>,
@@ -442,7 +540,10 @@ impl OverlayNode {
             inflight_ensure: Mutex::new(HashMap::new()),
             session_recovery_last: Mutex::new(HashMap::new()),
             pending_sends: Mutex::new(HashMap::new()),
-            reassembler: Mutex::new(LinkFragReassembler::new(self_name)),
+            pending_hop_acks: Mutex::new(HashMap::new()),
+            seen_hop_acks: Mutex::new(HashMap::new()),
+            reassembler: Mutex::new(LinkFragReassembler::new(self_name.clone())),
+            compact_reassembler: Mutex::new(CompactFragReassembler::new(self_name)),
             machine: Mutex::new(machine),
             cascade: Mutex::new(cascade),
             sink,
@@ -482,6 +583,7 @@ impl OverlayNode {
                             dispatch_actions(Arc::clone(&shared_loop), actions).await;
                         }
                         shared_loop.cascade.lock().await.cleanup(now_secs());
+                        pump_hop_retries(Arc::clone(&shared_loop)).await;
                     }
                     cmd = cmd_rx.recv() => {
                         match cmd {
@@ -717,6 +819,80 @@ async fn send_peer_framed(
     send_peer_framed_to(shared, peer, payload, None).await
 }
 
+async fn resolve_peer_addr(
+    shared: &SharedTransport,
+    peer: &str,
+    override_addr: Option<SocketAddr>,
+) -> Result<SocketAddr, TransportError> {
+    if peer == shared.self_name {
+        return Err(TransportError::UnknownPeer);
+    }
+    match override_addr {
+        Some(a) => Ok(a),
+        None => {
+            if let Some(&live) = shared.peer_addrs.lock().await.get(peer) {
+                Ok(live)
+            } else {
+                Ok(shared
+                    .config
+                    .peers
+                    .get(peer)
+                    .ok_or(TransportError::UnknownPeer)?
+                    .overlay_addr)
+            }
+        }
+    }
+}
+
+async fn send_peer_compact_framed(
+    shared: &SharedTransport,
+    peer: &str,
+    payload: &[u8],
+) -> Result<(), TransportError> {
+    let addr = resolve_peer_addr(shared, peer, None).await?;
+    let frames = fragment_compact_payload(&shared.self_name, peer, payload)
+        .map_err(|e| TransportError::Protocol(e.code()))?;
+    for frame in frames {
+        shared.socket.send_to(&frame, addr).await?;
+        shared
+            .counters
+            .udp_packets_tx
+            .fetch_add(1, Ordering::Relaxed);
+        shared
+            .counters
+            .udp_bytes_tx
+            .fetch_add(frame.len() as u64, Ordering::Relaxed);
+    }
+    Ok(())
+}
+
+async fn send_raw_udp_to(
+    shared: &SharedTransport,
+    peer: &str,
+    datagram: &[u8],
+    override_addr: Option<SocketAddr>,
+) -> Result<(), TransportError> {
+    let addr = resolve_peer_addr(shared, peer, override_addr).await?;
+    shared.socket.send_to(datagram, addr).await?;
+    shared
+        .counters
+        .udp_packets_tx
+        .fetch_add(1, Ordering::Relaxed);
+    shared
+        .counters
+        .udp_bytes_tx
+        .fetch_add(datagram.len() as u64, Ordering::Relaxed);
+    Ok(())
+}
+
+fn random_nonzero_ack_id() -> [u8; 8] {
+    let mut id = random_bytes::<8>();
+    if id == [0u8; 8] {
+        id[0] = 1;
+    }
+    id
+}
+
 async fn update_authenticated_peer_addr(shared: &SharedTransport, peer: &str, src: SocketAddr) {
     let mut map = shared.peer_addrs.lock().await;
     if map.get(peer) != Some(&src) {
@@ -920,6 +1096,160 @@ async fn cleanup_hs_waiters(shared: &SharedTransport, sid: &str) {
     shared.pending_init_auth.lock().await.remove(sid);
 }
 
+async fn send_prepared_with_active_session(
+    shared: &Arc<SharedTransport>,
+    peer: &str,
+    mtype: MessageType,
+    payload: Vec<u8>,
+) -> Result<bool, TransportError> {
+    if mtype.is_cascade_message() {
+        let use_ack = mtype != MessageType::CascadeClose && shared.config.hop_ack_retries > 0;
+        let ack_id = if use_ack {
+            random_nonzero_ack_id()
+        } else {
+            [0u8; 8]
+        };
+        let maybe_encoded = {
+            let sessions = shared.sessions.lock().await;
+            sessions.get(peer).map(|slot| {
+                encrypt_compact_link_frame(&slot.active, &shared.self_name, mtype, &payload, ack_id)
+                    .map(|wire| (slot.active.sid.clone(), wire))
+            })
+        };
+        let Some(encoded_res) = maybe_encoded else {
+            return Ok(false);
+        };
+        let (sid, wire) = encoded_res?;
+        if use_ack {
+            let timeout = Duration::from_millis(shared.config.hop_ack_timeout_ms.max(50));
+            let mut pending = shared.pending_hop_acks.lock().await;
+            if pending.len() >= MAX_PENDING_HOP_ACKS {
+                if let Some(oldest_key) = pending
+                    .iter()
+                    .min_by_key(|(_, v)| v.next_retry_at)
+                    .map(|(&k, _)| k)
+                {
+                    pending.remove(&oldest_key);
+                }
+            }
+            pending.insert(
+                ack_id,
+                PendingHopTx {
+                    peer: peer.to_owned(),
+                    sid,
+                    ack_id,
+                    mtype,
+                    payload,
+                    wire: wire.clone(),
+                    retries_done: 0,
+                    max_retries: shared.config.hop_ack_retries,
+                    next_retry_at: tokio::time::Instant::now() + timeout,
+                },
+            );
+        }
+        send_peer_compact_framed(shared, peer, &wire).await?;
+        Ok(true)
+    } else {
+        // Classic Python-compatible hex JSON `SecureEnvelope` + 700 B `LINK_FRAG` for MCC/PRIV.
+        let maybe_wire = {
+            let sessions = shared.sessions.lock().await;
+            sessions.get(peer).map(|slot| {
+                encrypt_link_envelope(&slot.active, &shared.self_name, mtype, &payload, None)
+            })
+        };
+        let Some(wire_res) = maybe_wire else {
+            return Ok(false);
+        };
+        let wire = wire_res?;
+        send_peer_framed(shared, peer, &wire).await?;
+        Ok(true)
+    }
+}
+
+async fn pump_hop_retries(shared: Arc<SharedTransport>) {
+    let now = tokio::time::Instant::now();
+    let base_ms = shared.config.hop_ack_timeout_ms.max(50);
+
+    // Collect expired entries under lock, then re-send / re-encrypt outside lock.
+    let mut to_resend: Vec<(String, Vec<u8>)> = Vec::new();
+    let mut to_reencrypt: Vec<([u8; 8], String, MessageType, Vec<u8>)> = Vec::new();
+    {
+        let mut pending = shared.pending_hop_acks.lock().await;
+        let sessions = shared.sessions.lock().await;
+        let mut drop_keys = Vec::new();
+
+        for (&ack_id, entry) in pending.iter_mut() {
+            if now < entry.next_retry_at {
+                continue;
+            }
+            if entry.retries_done >= entry.max_retries {
+                drop_keys.push(ack_id);
+                continue;
+            }
+            entry.retries_done = entry.retries_done.saturating_add(1);
+            let backoff_mult = 1u64 << (entry.retries_done.saturating_sub(1).min(3));
+            entry.next_retry_at = now + Duration::from_millis(base_ms.saturating_mul(backoff_mult));
+
+            match sessions.get(&entry.peer) {
+                Some(slot) if slot.active.sid == entry.sid => {
+                    to_resend.push((entry.peer.clone(), entry.wire.clone()));
+                }
+                Some(_) => {
+                    // Session rotated (e.g., automatic recovery after relay restart) -> re-encrypt!
+                    to_reencrypt.push((
+                        entry.ack_id,
+                        entry.peer.clone(),
+                        entry.mtype,
+                        entry.payload.clone(),
+                    ));
+                }
+                None => {
+                    // Session missing -> skip until re-established.
+                }
+            }
+        }
+        for k in drop_keys {
+            pending.remove(&k);
+        }
+    }
+
+    for (ack_id, peer, mtype, payload) in to_reencrypt {
+        let maybe_new = {
+            let sessions = shared.sessions.lock().await;
+            sessions.get(&peer).and_then(|slot| {
+                encrypt_compact_link_frame(&slot.active, &shared.self_name, mtype, &payload, ack_id)
+                    .ok()
+                    .map(|wire| (slot.active.sid.clone(), wire))
+            })
+        };
+        if let Some((new_sid, new_wire)) = maybe_new {
+            if let Some(entry) = shared.pending_hop_acks.lock().await.get_mut(&ack_id) {
+                entry.sid = new_sid;
+                entry.wire = new_wire.clone();
+            }
+            to_resend.push((peer, new_wire));
+        }
+    }
+
+    for (peer, wire) in to_resend {
+        shared
+            .counters
+            .hop_retries_tx
+            .fetch_add(1, Ordering::Relaxed);
+        if let Err(err) = send_peer_compact_framed(&shared, &peer, &wire).await {
+            debug!(peer, error = %err, "compact cascade hop retry send failed");
+        }
+    }
+
+    // Periodically prune expired hop deduplication entries.
+    {
+        let mut seen = shared.seen_hop_acks.lock().await;
+        if !seen.is_empty() {
+            seen.retain(|_, ts| now.duration_since(*ts) <= SEEN_HOP_ACK_TTL);
+        }
+    }
+}
+
 async fn flush_pending_sends(shared: Arc<SharedTransport>, peer: &str) {
     loop {
         let queued = { shared.pending_sends.lock().await.remove(peer) };
@@ -930,16 +1260,9 @@ async fn flush_pending_sends(shared: Arc<SharedTransport>, peer: &str) {
             return;
         }
         for (mtype, payload) in items {
-            let maybe_wire = {
-                let sessions = shared.sessions.lock().await;
-                sessions.get(peer).map(|slot| {
-                    encrypt_link_envelope(&slot.active, &shared.self_name, mtype, &payload, None)
-                })
-            };
-            if let Some(Ok(wire)) = maybe_wire {
-                if let Err(err) = send_peer_framed(&shared, peer, &wire).await {
-                    warn!(peer, error = %err, "queued send after session establishment failed");
-                }
+            if let Err(err) = send_prepared_with_active_session(&shared, peer, mtype, payload).await
+            {
+                warn!(peer, error = %err, "queued send after session establishment failed");
             }
         }
     }
@@ -951,29 +1274,18 @@ async fn send_link_encrypted(
     mtype: MessageType,
     payload: Vec<u8>,
 ) -> Result<(), TransportError> {
-    let maybe_wire = {
-        let sessions = shared.sessions.lock().await;
-        if let Some(slot) = sessions.get(peer) {
-            Some(encrypt_link_envelope(
-                &slot.active,
-                &shared.self_name,
-                mtype,
-                &payload,
-                None,
-            ))
-        } else {
-            let mut pending = shared.pending_sends.lock().await;
-            let queue = pending.entry(peer.to_owned()).or_default();
-            if queue.len() < MAX_PENDING_PER_PEER {
-                queue.push_back((mtype, payload));
-            }
-            None
-        }
-    };
+    if shared.sessions.lock().await.contains_key(peer)
+        && send_prepared_with_active_session(&shared, peer, mtype, payload.clone()).await?
+    {
+        return Ok(());
+    }
 
-    if let Some(wire_res) = maybe_wire {
-        let wire = wire_res?;
-        return send_peer_framed(&shared, peer, &wire).await;
+    {
+        let mut pending = shared.pending_sends.lock().await;
+        let queue = pending.entry(peer.to_owned()).or_default();
+        if queue.len() < MAX_PENDING_PER_PEER {
+            queue.push_back((mtype, payload));
+        }
     }
 
     let s = Arc::clone(&shared);
@@ -1130,7 +1442,166 @@ async fn dispatch_cascade_actions(shared: Arc<SharedTransport>, actions: Vec<Cas
     }
 }
 
+async fn handle_compact_udp_packet(shared: Arc<SharedTransport>, data: Vec<u8>, src: SocketAddr) {
+    let peer = if let Some(p) = shared.addr_to_peer.get(&src) {
+        p.clone()
+    } else if let Some(from) = peek_compact_sender(&data) {
+        if from != shared.self_name && shared.config.peers.contains_key(from) {
+            from.to_owned()
+        } else {
+            debug!(%src, from, "dropping compact packet from unknown udp peer");
+            return;
+        }
+    } else {
+        debug!(%src, "dropping compact packet with missing sender");
+        return;
+    };
+
+    let Ok(frame) = decode_compact_frame(&data) else {
+        return;
+    };
+    match frame {
+        CompactFrame::Frag(frag) => {
+            let now_s = now_secs();
+            let assembled = shared
+                .compact_reassembler
+                .lock()
+                .await
+                .ingest(&peer, &frag, now_s)
+                .ok()
+                .flatten();
+            if let Some(full) = assembled {
+                Box::pin(handle_udp_packet(shared, full, src)).await;
+            }
+        }
+        CompactFrame::HopAck(ack) => {
+            let verified_ack = {
+                let sessions = shared.sessions.lock().await;
+                sessions
+                    .get(&peer)
+                    .and_then(|slot| slot.decrypt_compact_ack(&shared.self_name, &ack).ok())
+            };
+            if let Some(ack_id) = verified_ack {
+                update_authenticated_peer_addr(&shared, &peer, src).await;
+                shared.pending_hop_acks.lock().await.remove(&ack_id);
+                shared.counters.hop_ack_rx.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+        CompactFrame::Secure(env) => {
+            if !env.message_type.is_secure_hop_message() {
+                return;
+            }
+            let decrypt_result = {
+                let sessions = shared.sessions.lock().await;
+                match sessions.get(&peer) {
+                    None => Err(false),
+                    Some(slot) => match slot.decrypt_compact(&shared.self_name, &env) {
+                        Ok(ok) => Ok(ok),
+                        Err(_) => Err(true),
+                    },
+                }
+            };
+            let CompactDecryptOk {
+                plaintext: plain,
+                matched_sid,
+                ack_wire,
+            } = match decrypt_result {
+                Ok(ok) => ok,
+                Err(had_session) => {
+                    trigger_rate_limited_session_recovery(shared, &peer, had_session).await;
+                    return;
+                }
+            };
+            update_authenticated_peer_addr(&shared, &peer, src).await;
+
+            if let Some(ack_bytes) = ack_wire {
+                if send_raw_udp_to(&shared, &peer, &ack_bytes, Some(src))
+                    .await
+                    .is_ok()
+                {
+                    shared.counters.hop_ack_tx.fetch_add(1, Ordering::Relaxed);
+                }
+            }
+
+            if env.ack_id != [0u8; 8] {
+                let now = tokio::time::Instant::now();
+                let mut seen = shared.seen_hop_acks.lock().await;
+                let key = (peer.clone(), matched_sid, env.ack_id);
+                if let Some(&ts) = seen.get(&key) {
+                    if now.duration_since(ts) <= SEEN_HOP_ACK_TTL {
+                        // Duplicate retry already processed; ACK was re-sent above.
+                        return;
+                    }
+                }
+                if seen.len() >= MAX_SEEN_HOP_ACKS {
+                    seen.retain(|_, ts| now.duration_since(*ts) <= SEEN_HOP_ACK_TTL);
+                    if seen.len() >= MAX_SEEN_HOP_ACKS {
+                        if let Some(oldest) = seen
+                            .iter()
+                            .min_by_key(|(_, ts)| *ts)
+                            .map(|(k, _)| k.clone())
+                        {
+                            seen.remove(&oldest);
+                        }
+                    }
+                }
+                seen.insert(key, now);
+            }
+
+            deliver_verified_hop_payload(shared, &peer, env.message_type, plain).await;
+        }
+    }
+}
+
+async fn deliver_verified_hop_payload(
+    shared: Arc<SharedTransport>,
+    peer: &str,
+    mtype: MessageType,
+    plain: Vec<u8>,
+) {
+    if mtype.is_cascade_message() {
+        shared
+            .counters
+            .cascade_msgs_rx
+            .fetch_add(1, Ordering::Relaxed);
+        let Ok(msg_val) = jload(&plain) else {
+            return;
+        };
+        let res = {
+            shared
+                .cascade
+                .lock()
+                .await
+                .receive(peer, mtype, &msg_val, "", now_secs())
+        };
+        match res {
+            Ok(actions) => dispatch_cascade_actions(shared, actions).await,
+            Err(err) => {
+                debug!(
+                    node = %shared.self_name,
+                    peer,
+                    msg_type = mtype.as_str(),
+                    code = err.code(),
+                    "cascade rejected message"
+                );
+            }
+        }
+    } else {
+        shared.counters.mcc_msgs_rx.fetch_add(1, Ordering::Relaxed);
+        let actions = shared
+            .machine
+            .lock()
+            .await
+            .on_inbound(peer, mtype, &plain, now_ms());
+        dispatch_actions(shared, actions).await;
+    }
+}
+
 async fn handle_udp_packet(shared: Arc<SharedTransport>, data: Vec<u8>, src: SocketAddr) {
+    if is_compact_frame(&data) {
+        handle_compact_udp_packet(shared, data, src).await;
+        return;
+    }
     let Ok(val) = jload(&data) else {
         return;
     };
@@ -1261,44 +1732,7 @@ async fn handle_udp_packet(shared: Arc<SharedTransport>, data: Vec<u8>, src: Soc
                 }
             };
             update_authenticated_peer_addr(&shared, &peer, src).await;
-
-            if mtype.is_cascade_message() {
-                shared
-                    .counters
-                    .cascade_msgs_rx
-                    .fetch_add(1, Ordering::Relaxed);
-                let Ok(msg_val) = jload(&plain) else {
-                    return;
-                };
-                let res = {
-                    shared
-                        .cascade
-                        .lock()
-                        .await
-                        .receive(&peer, mtype, &msg_val, "", now_secs())
-                };
-                match res {
-                    Ok(actions) => dispatch_cascade_actions(shared, actions).await,
-                    Err(err) => {
-                        debug!(
-                            node = %shared.self_name,
-                            peer,
-                            msg_type = mtype.as_str(),
-                            code = err.code(),
-                            "cascade rejected message"
-                        );
-                    }
-                }
-            } else {
-                shared.counters.mcc_msgs_rx.fetch_add(1, Ordering::Relaxed);
-                let actions =
-                    shared
-                        .machine
-                        .lock()
-                        .await
-                        .on_inbound(&peer, mtype, &plain, now_ms());
-                dispatch_actions(shared, actions).await;
-            }
+            deliver_verified_hop_payload(shared, &peer, mtype, plain).await;
         }
     }
 }

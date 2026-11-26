@@ -99,6 +99,10 @@ pub struct NodeTransportConfig {
     pub udp_timeout_ms: u64,
     /// Number of MGMT handshake retry attempts.
     pub retries: usize,
+    /// Initial hop-by-hop ACK timeout for compact `CASCADE_*` frames in milliseconds.
+    pub hop_ack_timeout_ms: u64,
+    /// Maximum hop-by-hop retransmission retries for unacknowledged `CASCADE_*` frames (`0` disables ACK/retry).
+    pub hop_ack_retries: u8,
     /// Whether to proactively establish hop MGMT sessions to peers at startup.
     pub preconnect: bool,
     /// Peer names excluded from proactive startup MGMT preconnect (e.g., direct VPN peer
@@ -122,6 +126,8 @@ impl fmt::Debug for NodeTransportConfig {
             .field("policy", &self.policy)
             .field("udp_timeout_ms", &self.udp_timeout_ms)
             .field("retries", &self.retries)
+            .field("hop_ack_timeout_ms", &self.hop_ack_timeout_ms)
+            .field("hop_ack_retries", &self.hop_ack_retries)
             .field("preconnect", &self.preconnect)
             .field("preconnect_exclude", &self.preconnect_exclude)
             .field("has_socket_protector", &self.socket_protector.is_some())
@@ -147,6 +153,8 @@ impl NodeTransportConfig {
             policy: SelectionPolicy::default(),
             udp_timeout_ms: 1200,
             retries: 4,
+            hop_ack_timeout_ms: 250,
+            hop_ack_retries: 3,
             preconnect: true,
             preconnect_exclude: Vec::new(),
             deterministic_seed: None,

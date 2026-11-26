@@ -2,6 +2,7 @@
 //! Wire protocol types, canonical JSON codecs, `LINK_FRAG` framing, and IKEv2/WireGuard parsers.
 
 pub mod canonical;
+pub mod compact;
 pub mod error;
 pub mod ikev2;
 pub mod link_frag;
@@ -12,6 +13,14 @@ pub use canonical::{
     CanonicalValue, MAX_JSON_DEPTH, MAX_JSON_FIELDS, MAX_JSON_ITEMS, MAX_JSON_KEY_LEN,
     canonical_bytes_from_value, canonical_object_bytes, jdump, jdump_value, jload,
     parse_strict_json_object,
+};
+pub use compact::{
+    COMPACT_FRAG_CHUNK_BYTES, COMPACT_FRAG_MAX_ASSEMBLED, COMPACT_FRAG_MAX_BUFFERS,
+    COMPACT_FRAG_MAX_TOTAL, COMPACT_FRAG_MAX_WIRE, COMPACT_FRAG_TTL_SECS, COMPACT_KIND_FRAG,
+    COMPACT_KIND_HOP_ACK, COMPACT_KIND_SECURE, COMPACT_MAGIC, CompactFragFrame,
+    CompactFragReassembler, CompactFrame, CompactHopAckFrame, CompactSecureFrame,
+    decode_compact_frame, fragment_compact_payload, fragment_compact_payload_with_id,
+    is_compact_frame, message_type_from_code, message_type_to_code, peek_compact_sender,
 };
 pub use error::ProtoError;
 pub use ikev2::{
@@ -293,6 +302,95 @@ mod tests {
         assert_eq!(
             canonical_object_bytes(&ok, 1024).unwrap(),
             br#"{"a":1,"b":2}"#
+        );
+    }
+
+    #[test]
+    fn compact_cascade_3584b_fits_in_four_udp_fragments_under_wan_mtu() {
+        let env = CompactSecureFrame {
+            message_type: MessageType::CascadeBuild,
+            from: "X1".to_owned(),
+            to: "X2".to_owned(),
+            sid: "0123456789abcdef".to_owned(),
+            ack_id: [1, 2, 3, 4, 5, 6, 7, 8],
+            nonce: [0x11; 12],
+            ct: vec![0xAB; 3584 + 16], // 3584 B padded CASCADE_* + 16 B GCM tag
+        };
+        let wire = env.encode().unwrap();
+        assert!(is_compact_frame(&wire));
+        assert_eq!(peek_compact_sender(&wire), Some("X1"));
+
+        let frags = fragment_compact_payload("X1", "X2", &wire).unwrap();
+        assert_eq!(
+            frags.len(),
+            4,
+            "3584 B padded cascade ciphertext must fit in exactly 4 UDP fragments (got {})",
+            frags.len()
+        );
+        assert!(frags.iter().all(|f| f.len() <= COMPACT_FRAG_MAX_WIRE));
+        assert!(frags.iter().all(|f| peek_compact_sender(f) == Some("X1")));
+
+        let mut rx = CompactFragReassembler::new("X2");
+        let mut assembled = None;
+        for (idx, raw) in frags.iter().enumerate() {
+            let CompactFrame::Frag(frag) = decode_compact_frame(raw).unwrap() else {
+                panic!("expected compact frag");
+            };
+            let res = rx.ingest("X1", &frag, 10.0 + idx as f64).unwrap();
+            if idx + 1 < frags.len() {
+                assert!(res.is_none());
+            } else {
+                assembled = res;
+            }
+        }
+        let full = assembled.unwrap();
+        assert_eq!(full, wire);
+        assert_eq!(rx.active_buffers(), 0);
+        let CompactFrame::Secure(decoded) = decode_compact_frame(&full).unwrap() else {
+            panic!("expected compact secure frame");
+        };
+        assert_eq!(decoded, env);
+
+        // Nested compact fragment inside reassembled payload must be rejected fail-closed!
+        let inner_frag = CompactFragFrame {
+            from: "X1".to_owned(),
+            to: "X2".to_owned(),
+            frag_id: [9; 8],
+            seq: 0,
+            total: 1,
+            data: vec![0x55; COMPACT_FRAG_CHUNK_BYTES],
+        }
+        .encode()
+        .unwrap();
+        let mut oversized_nested = inner_frag;
+        oversized_nested.resize(COMPACT_FRAG_MAX_WIRE + 50, 0x42);
+        let outer =
+            fragment_compact_payload_with_id("X1", "X2", &oversized_nested, [7; 8]).unwrap();
+        let mut nested_err = None;
+        for raw in outer {
+            let CompactFrame::Frag(f) = decode_compact_frame(&raw).unwrap() else {
+                panic!("expected frag");
+            };
+            if let Err(e) = rx.ingest("X1", &f, 20.0) {
+                nested_err = Some(e);
+            }
+        }
+        assert_eq!(nested_err, Some(ProtoError::NestedLinkFrag));
+
+        // Compact hop ACK roundtrip (~64 B single UDP datagram)
+        let ack = CompactHopAckFrame {
+            from: "X2".to_owned(),
+            to: "X1".to_owned(),
+            sid: "0123456789abcdef".to_owned(),
+            nonce: [0x22; 12],
+            ct: [0x33; 24],
+        };
+        let ack_wire = ack.encode().unwrap();
+        assert!(ack_wire.len() < 80);
+        assert_eq!(peek_compact_sender(&ack_wire), Some("X2"));
+        assert_eq!(
+            decode_compact_frame(&ack_wire).unwrap(),
+            CompactFrame::HopAck(ack)
         );
     }
 }

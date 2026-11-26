@@ -9,6 +9,7 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
+base64.workspace = true
 cco-cascade.workspace = true
 cco-crypto.workspace = true
 cco-proto.workspace = true

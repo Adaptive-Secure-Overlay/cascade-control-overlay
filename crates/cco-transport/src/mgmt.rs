@@ -1,14 +1,16 @@
 #![forbid(unsafe_code)]
 //! 4-step MGMT hop handshake and AES-256-GCM link framing (`node_daemon.py` wire compatible).
 
+use base64::Engine;
+use base64::engine::general_purpose::STANDARD as B64;
 use cco_crypto::{
     Key256, X25519PublicKey, X25519SecretKey, aes256_gcm_decrypt, aes256_gcm_encrypt,
     decode_canonical_hex, decode_canonical_hex_vec, derive_mgmt_key, link_message_aad,
     mgmt_auth_aad, random_bytes,
 };
 use cco_proto::{
-    MessageType, MgmtAuth, MgmtInit, MgmtInitResp, SecureEnvelope, T_MGMT_AUTH, T_MGMT_AUTH_RESP,
-    T_MGMT_INIT, T_MGMT_INIT_RESP, jdump,
+    CompactHopAckFrame, CompactSecureFrame, MessageType, MgmtAuth, MgmtInit, MgmtInitResp,
+    SecureEnvelope, T_MGMT_AUTH, T_MGMT_AUTH_RESP, T_MGMT_INIT, T_MGMT_INIT_RESP, jdump,
 };
 use serde_json::{Map, Value};
 
@@ -233,7 +235,7 @@ pub fn responder_handle_auth(
     ))
 }
 
-/// Encrypts a hop payload into a `SecureEnvelope` wire JSON frame (`node_daemon.py::link_send`).
+/// Encrypts a hop payload into a Python-compatible hex `SecureEnvelope` JSON frame (`node_daemon.py::link_send`).
 pub fn encrypt_link_envelope(
     session: &MgmtSession,
     self_name: &str,
@@ -251,12 +253,37 @@ pub fn encrypt_link_envelope(
         to: session.peer.clone(),
         nonce: hex::encode(nonce),
         ct: hex::encode(ct),
+        enc: None,
         meta: meta.unwrap_or_else(|| Value::Object(Map::new())),
     };
     jdump(&env).map_err(|_| TransportError::Protocol("link_envelope_encode"))
 }
 
-/// Decrypts an incoming `SecureEnvelope` using the active [`MgmtSession`] (`node_daemon.py::link_decrypt`).
+/// Encrypts a hop payload into a compact base64 JSON `SecureEnvelope` (`enc = "b64"`).
+pub fn encrypt_link_envelope_b64(
+    session: &MgmtSession,
+    self_name: &str,
+    mtype: MessageType,
+    payload: &[u8],
+    meta: Option<Value>,
+) -> Result<Vec<u8>, TransportError> {
+    let aad = link_message_aad(mtype.as_str(), self_name, &session.peer, &session.sid);
+    let (nonce, ct) = aes256_gcm_encrypt(&session.key, payload, &aad)
+        .map_err(|_| TransportError::Protocol("link_encrypt_failed"))?;
+    let env = SecureEnvelope {
+        t: mtype.as_str().to_owned(),
+        sid: session.sid.clone(),
+        from: self_name.to_owned(),
+        to: session.peer.clone(),
+        nonce: B64.encode(nonce),
+        ct: B64.encode(ct),
+        enc: Some("b64".to_owned()),
+        meta: meta.unwrap_or_else(|| Value::Object(Map::new())),
+    };
+    jdump(&env).map_err(|_| TransportError::Protocol("link_envelope_encode"))
+}
+
+/// Decrypts an incoming JSON `SecureEnvelope` (supporting both legacy Python `hex` and compact `b64`).
 pub fn decrypt_link_envelope(
     session: &MgmtSession,
     self_name: &str,
@@ -268,18 +295,150 @@ pub fn decrypt_link_envelope(
     if !env.sid.is_empty() && env.sid != session.sid {
         return Err(TransportError::Protocol("stale_session_id"));
     }
-    let nonce = decode_canonical_hex::<12>(&env.nonce)
-        .map_err(|_| TransportError::Protocol("invalid_link_nonce"))?;
-    let ct = decode_canonical_hex_vec(&env.ct, 65_535)
-        .map_err(|_| TransportError::Protocol("invalid_link_ct"))?;
+    let (nonce, ct) = match env.enc.as_deref() {
+        None | Some("hex") => {
+            let nonce = decode_canonical_hex::<12>(&env.nonce)
+                .map_err(|_| TransportError::Protocol("invalid_link_nonce"))?;
+            let ct = decode_canonical_hex_vec(&env.ct, 65_535)
+                .map_err(|_| TransportError::Protocol("invalid_link_ct"))?;
+            (nonce, ct)
+        }
+        Some("b64") => {
+            let nonce_vec = B64
+                .decode(env.nonce.as_bytes())
+                .map_err(|_| TransportError::Protocol("invalid_link_nonce"))?;
+            let nonce: [u8; 12] = nonce_vec
+                .try_into()
+                .map_err(|_| TransportError::Protocol("invalid_link_nonce"))?;
+            let ct = B64
+                .decode(env.ct.as_bytes())
+                .map_err(|_| TransportError::Protocol("invalid_link_ct"))?;
+            if ct.len() > 65_535 {
+                return Err(TransportError::Protocol("invalid_link_ct"));
+            }
+            (nonce, ct)
+        }
+        Some(_) => return Err(TransportError::Protocol("unsupported_link_encoding")),
+    };
     let aad = link_message_aad(&env.t, &env.from, self_name, &session.sid);
     aes256_gcm_decrypt(&session.key, &nonce, &ct, &aad)
         .map_err(|_| TransportError::Protocol("link_decrypt_failed"))
 }
 
+fn compact_link_aad(
+    mtype: MessageType,
+    from: &str,
+    to: &str,
+    sid: &str,
+    ack_id: &[u8; 8],
+) -> Vec<u8> {
+    format!(
+        "CCO1:{}:{from}->{to}:{sid}:{}",
+        mtype.as_str(),
+        hex::encode(ack_id)
+    )
+    .into_bytes()
+}
+
+fn compact_hop_ack_aad(from: &str, to: &str, sid: &str) -> Vec<u8> {
+    format!("CCO1_ACK:{from}->{to}:{sid}").into_bytes()
+}
+
+/// Encrypts a hop payload into a compact binary `CCO1` frame (`3,584 B` cascade -> `~3,651 B`, 4 UDP frags).
+pub fn encrypt_compact_link_frame(
+    session: &MgmtSession,
+    self_name: &str,
+    mtype: MessageType,
+    payload: &[u8],
+    ack_id: [u8; 8],
+) -> Result<Vec<u8>, TransportError> {
+    let aad = compact_link_aad(mtype, self_name, &session.peer, &session.sid, &ack_id);
+    let (nonce, ct) = aes256_gcm_encrypt(&session.key, payload, &aad)
+        .map_err(|_| TransportError::Protocol("link_encrypt_failed"))?;
+    let frame = CompactSecureFrame {
+        message_type: mtype,
+        from: self_name.to_owned(),
+        to: session.peer.clone(),
+        sid: session.sid.clone(),
+        ack_id,
+        nonce,
+        ct,
+    };
+    frame
+        .encode()
+        .map_err(|_| TransportError::Protocol("compact_envelope_encode"))
+}
+
+/// Decrypts an incoming `CCO1` compact encrypted hop envelope using `session`.
+pub fn decrypt_compact_link_frame(
+    session: &MgmtSession,
+    self_name: &str,
+    frame: &CompactSecureFrame,
+) -> Result<Vec<u8>, TransportError> {
+    if frame.from != session.peer || frame.to != self_name {
+        return Err(TransportError::Protocol("link_endpoint_mismatch"));
+    }
+    if frame.sid != session.sid {
+        return Err(TransportError::Protocol("stale_session_id"));
+    }
+    let aad = compact_link_aad(
+        frame.message_type,
+        &frame.from,
+        self_name,
+        &session.sid,
+        &frame.ack_id,
+    );
+    aes256_gcm_decrypt(&session.key, &frame.nonce, &frame.ct, &aad)
+        .map_err(|_| TransportError::Protocol("link_decrypt_failed"))
+}
+
+/// Builds an AEAD-authenticated compact hop-by-hop ACK for `ack_id` (~64 B single UDP datagram).
+pub fn encrypt_compact_hop_ack(
+    session: &MgmtSession,
+    self_name: &str,
+    ack_id: [u8; 8],
+) -> Result<Vec<u8>, TransportError> {
+    let aad = compact_hop_ack_aad(self_name, &session.peer, &session.sid);
+    let (nonce, ct_vec) = aes256_gcm_encrypt(&session.key, &ack_id, &aad)
+        .map_err(|_| TransportError::Protocol("hop_ack_encrypt_failed"))?;
+    let ct: [u8; 24] = ct_vec
+        .try_into()
+        .map_err(|_| TransportError::Protocol("hop_ack_encrypt_failed"))?;
+    let frame = CompactHopAckFrame {
+        from: self_name.to_owned(),
+        to: session.peer.clone(),
+        sid: session.sid.clone(),
+        nonce,
+        ct,
+    };
+    frame
+        .encode()
+        .map_err(|_| TransportError::Protocol("hop_ack_encode"))
+}
+
+/// Verifies and decrypts an incoming AEAD-authenticated compact hop-by-hop ACK.
+pub fn decrypt_compact_hop_ack(
+    session: &MgmtSession,
+    self_name: &str,
+    frame: &CompactHopAckFrame,
+) -> Result<[u8; 8], TransportError> {
+    if frame.from != session.peer || frame.to != self_name {
+        return Err(TransportError::Protocol("link_endpoint_mismatch"));
+    }
+    if frame.sid != session.sid {
+        return Err(TransportError::Protocol("stale_session_id"));
+    }
+    let aad = compact_hop_ack_aad(&frame.from, self_name, &session.sid);
+    let pt = aes256_gcm_decrypt(&session.key, &frame.nonce, &frame.ct, &aad)
+        .map_err(|_| TransportError::Protocol("hop_ack_decrypt_failed"))?;
+    pt.try_into()
+        .map_err(|_| TransportError::Protocol("hop_ack_decrypt_failed"))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use cco_proto::{CompactFrame, decode_compact_frame, fragment_compact_payload};
 
     #[test]
     fn four_step_mgmt_handshake_and_link_aead_roundtrip() {
@@ -300,10 +459,54 @@ mod tests {
         assert_eq!(sess_a.sid, sess_x1.sid);
         assert!(sess_a.key.ct_eq(&sess_x1.key));
 
+        // 1. Legacy Python-compatible hex SecureEnvelope
         let wire =
             encrypt_link_envelope(&sess_a, "A", MessageType::MccStart, b"hello-hop", None).unwrap();
         let env: SecureEnvelope = serde_json::from_slice(&wire).unwrap();
+        assert_eq!(env.enc, None);
         let pt = decrypt_link_envelope(&sess_x1, "X1", &env).unwrap();
         assert_eq!(pt, b"hello-hop");
+
+        // 2. Compact JSON base64 SecureEnvelope (`enc = "b64"`)
+        let wire_b64 =
+            encrypt_link_envelope_b64(&sess_a, "A", MessageType::CascadeBuild, b"hello-b64", None)
+                .unwrap();
+        let env_b64: SecureEnvelope = serde_json::from_slice(&wire_b64).unwrap();
+        assert_eq!(env_b64.enc.as_deref(), Some("b64"));
+        assert_eq!(
+            decrypt_link_envelope(&sess_x1, "X1", &env_b64).unwrap(),
+            b"hello-b64"
+        );
+
+        // 3. Compact binary CCO1 frame (3,584 B cascade -> 4 UDP fragments!) + authenticated hop ACK
+        let padded = vec![b'P'; 3584];
+        let ack_id = [0x10, 0x20, 0x30, 0x40, 0x50, 0x60, 0x70, 0x80];
+        let cwire =
+            encrypt_compact_link_frame(&sess_a, "A", MessageType::CascadeBuild, &padded, ack_id)
+                .unwrap();
+        let cfrags = fragment_compact_payload("A", "X1", &cwire).unwrap();
+        assert_eq!(cfrags.len(), 4);
+        let CompactFrame::Secure(mut decoded) = decode_compact_frame(&cwire).unwrap() else {
+            panic!("expected compact secure frame");
+        };
+        assert_eq!(
+            decrypt_compact_link_frame(&sess_x1, "X1", &decoded).unwrap(),
+            padded
+        );
+        // Tampering ack_id breaks AEAD AAD!
+        decoded.ack_id[0] ^= 0xff;
+        assert!(decrypt_compact_link_frame(&sess_x1, "X1", &decoded).is_err());
+
+        // Hop ACK roundtrip + tamper rejection
+        let ack_wire = encrypt_compact_hop_ack(&sess_x1, "X1", ack_id).unwrap();
+        let CompactFrame::HopAck(mut ack_frame) = decode_compact_frame(&ack_wire).unwrap() else {
+            panic!("expected compact hop ack");
+        };
+        assert_eq!(
+            decrypt_compact_hop_ack(&sess_a, "A", &ack_frame).unwrap(),
+            ack_id
+        );
+        ack_frame.ct[0] ^= 0x01;
+        assert!(decrypt_compact_hop_ack(&sess_a, "A", &ack_frame).is_err());
     }
 }

@@ -292,6 +292,9 @@ pub struct SecureEnvelope {
     pub to: String,
     pub nonce: String,
     pub ct: String,
+    /// Optional encoding marker (`None` / `"hex"` for Python-compatible hex; `"b64"` for base64).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub enc: Option<String>,
     #[serde(default)]
     pub meta: Value,
 }
