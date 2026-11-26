@@ -1,0 +1,31 @@
+[package]
+name = "cco-ffi"
+description = "Cross-platform FFI facade (C-ABI for Windows C# & macOS Swift, JNI for Android VpnService) over cco-wg-tunnel, cco-trust, and cco-analytics"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[lib]
+name = "cco_ffi"
+crate-type = ["cdylib", "staticlib", "rlib"]
+
+[dependencies]
+cco-analytics.workspace = true
+cco-cascade.workspace = true
+cco-crypto.workspace = true
+cco-proto.workspace = true
+cco-transport.workspace = true
+cco-trust.workspace = true
+cco-wg-tunnel.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tempfile.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+zeroize.workspace = true
+
+[target.'cfg(target_os = "android")'.dependencies]
+jni = "0.21"

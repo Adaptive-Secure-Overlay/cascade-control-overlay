@@ -8,6 +8,7 @@ members = [
     "crates/cco-transport",
     "crates/cco-linux-proxy",
     "crates/cco-wg-tunnel",
+    "crates/cco-ffi",
     "crates/cco-analytics",
     "crates/cco-cli",
 ]

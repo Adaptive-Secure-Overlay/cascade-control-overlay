@@ -16,3 +16,22 @@ Thumbs.db
 *.tmp
 *.last-valid.json
 *.state.json
+
+# GUI build artifacts & native binaries (never commit compiled libs/APKs/DLLs)
+*.apk
+*.aab
+*.so
+*.dll
+*.dylib
+*.a
+apps/android/.gradle/
+apps/android/.idea/
+apps/android/local.properties
+apps/android/**/build/
+apps/android/app/src/main/jniLibs/
+apps/windows/**/bin/
+apps/windows/**/obj/
+apps/windows/.vs/
+apps/windows/native/
+apps/macos/**/.build/
+apps/macos/**/.swiftpm/
