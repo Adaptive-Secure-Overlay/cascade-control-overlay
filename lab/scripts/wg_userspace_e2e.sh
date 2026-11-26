@@ -22,6 +22,11 @@ fi
 CCO_BIN="${CCO_BIN:-$(command -v cco || true)}"
 OVERLAY_PORT="${OVERLAY_PORT:-9000}"
 WG_DIRECT_PORT="${WG_DIRECT_PORT:-51820}"
+CCO_ROUTE_MODE="${CCO_ROUTE_MODE:-mcc2}"
+CCO_HOPS="${CCO_HOPS:-3}"
+CCO_MAX_HOPS="${CCO_MAX_HOPS:-16}"
+CCO_HOP_MODEL="${CCO_HOP_MODEL:-f4}"
+CCO_PARALLEL_CHAINS="${CCO_PARALLEL_CHAINS:-2}"
 
 if [[ -z "$CCO_BIN" || ! -x "$CCO_BIN" ]]; then
   echo "ERROR: cco binary not found; build with 'cargo build --release -p cco-cli' and set CCO_BIN" >&2
@@ -146,6 +151,11 @@ for relay in X1 X2; do
     --signing-key "$WORKDIR/keys/${relay}/signing.key" \
     --encryption-key "$WORKDIR/keys/${relay}/encryption.key" \
     --replay-db "$WORKDIR/db/${relay}.sqlite" \
+    --route-mode "$CCO_ROUTE_MODE" \
+    --hops "$CCO_HOPS" \
+    --max-hops "$CCO_MAX_HOPS" \
+    --hop-model "$CCO_HOP_MODEL" \
+    --parallel-chains "$CCO_PARALLEL_CHAINS" \
     --mode first --x1-fanout 2 --x2-fanout 2 --ike-fanout 1 \
     >"$WORKDIR/logs/cco-${relay}.log" 2>&1 &
   PIDS+=("$!")
@@ -167,6 +177,11 @@ ip netns exec cco-wg-B env RUST_LOG=info "$CCO_BIN" wg-tunnel \
   --direct-bind "192.0.2.13:${WG_DIRECT_PORT}" \
   --peer-direct-addr "192.0.2.10:${WG_DIRECT_PORT}" \
   --tun-name cco0 \
+  --route-mode "$CCO_ROUTE_MODE" \
+  --hops "$CCO_HOPS" \
+  --max-hops "$CCO_MAX_HOPS" \
+  --hop-model "$CCO_HOP_MODEL" \
+  --parallel-chains "$CCO_PARALLEL_CHAINS" \
   --mode first --x1-fanout 2 --x2-fanout 2 --ike-fanout 1 \
   --stats-out "$WORKDIR/stats-B.json" \
   >"$WORKDIR/logs/cco-B.log" 2>&1 &
@@ -187,6 +202,11 @@ ip netns exec cco-wg-A env RUST_LOG=info "$CCO_BIN" wg-tunnel \
   --direct-bind "192.0.2.10:${WG_DIRECT_PORT}" \
   --peer-direct-addr "192.0.2.13:${WG_DIRECT_PORT}" \
   --tun-name cco0 \
+  --route-mode "$CCO_ROUTE_MODE" \
+  --hops "$CCO_HOPS" \
+  --max-hops "$CCO_MAX_HOPS" \
+  --hop-model "$CCO_HOP_MODEL" \
+  --parallel-chains "$CCO_PARALLEL_CHAINS" \
   --mode first --x1-fanout 2 --x2-fanout 2 --ike-fanout 1 \
   --initiate \
   --stats-out "$WORKDIR/stats-A.json" \
@@ -202,12 +222,18 @@ for pair in "A:198.51.100.10/24" "B:198.51.100.13/24"; do
     fi
     sleep 0.1
   done
+  ip netns exec "cco-wg-${node}" sysctl -qw "net.ipv6.conf.cco0.disable_ipv6=1" 2>/dev/null || true
   ip netns exec "cco-wg-${node}" ip addr add "$cidr" dev cco0
   ip netns exec "cco-wg-${node}" ip link set cco0 mtu 1420 up
 done
 
-echo "[6/7] Waiting for MCC WireGuard handshake and running 5 ICMP probes through direct Type 4..."
-sleep 1.5
+echo "[6/7] Waiting for overlay WireGuard handshake and running 5 ICMP probes through direct Type 4..."
+for _ in $(seq 1 50); do
+  if [[ -f "$WORKDIR/stats-A.json" ]] && grep -q '"connected_direct_data"' "$WORKDIR/stats-A.json" 2>/dev/null; then
+    break
+  fi
+  sleep 0.2
+done
 ip netns exec cco-wg-A ping -c 5 -i 0.2 -W 2 198.51.100.13
 
 sleep 0.6

@@ -6,6 +6,11 @@ NODE_NAME="${1:?node name required}"
 ROLE="${2:-relay}"
 STATE_DIR="${STATE_DIR:-/state}"
 OVERLAY_PORT="${OVERLAY_PORT:-9000}"
+CCO_ROUTE_MODE="${CCO_ROUTE_MODE:-mcc2}"
+CCO_HOPS="${CCO_HOPS:-3}"
+CCO_MAX_HOPS="${CCO_MAX_HOPS:-16}"
+CCO_HOP_MODEL="${CCO_HOP_MODEL:-f4}"
+CCO_PARALLEL_CHAINS="${CCO_PARALLEL_CHAINS:-2}"
 
 EXTRA_ARGS=()
 if [[ "$ROLE" == "endpoint" ]]; then
@@ -23,6 +28,11 @@ exec cco node \
   --signing-key "$STATE_DIR/keys/${NODE_NAME}/signing.key" \
   --encryption-key "$STATE_DIR/keys/${NODE_NAME}/encryption.key" \
   --replay-db "$STATE_DIR/db/${NODE_NAME}.sqlite" \
+  --route-mode "$CCO_ROUTE_MODE" \
+  --hops "$CCO_HOPS" \
+  --max-hops "$CCO_MAX_HOPS" \
+  --hop-model "$CCO_HOP_MODEL" \
+  --parallel-chains "$CCO_PARALLEL_CHAINS" \
   --mode first \
   --x1-fanout 2 \
   --x2-fanout 2 \

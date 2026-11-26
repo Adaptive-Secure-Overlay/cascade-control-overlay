@@ -8,6 +8,7 @@ use std::collections::BTreeMap;
 use std::fs;
 use std::net::{Ipv4Addr, SocketAddr, UdpSocket as StdUdpSocket};
 use std::path::Path;
+#[cfg(not(target_os = "linux"))]
 use std::process::Command;
 use std::sync::{Arc, Mutex as StdMutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -191,8 +192,9 @@ fn measure_rss_mib() -> f64 {
             .output()
         {
             if let Ok(txt) = String::from_utf8(out.stdout) {
-                // CSV last field is memory in KB (e.g., `"42,128 K"` or `"42 128 КБ"`).
-                if let Some(last_col) = txt.trim().rsplit(',').next() {
+                // CSV fields are quoted (`"cco.exe","1234","Console","1","28,512 K"`),
+                // so split on `","` rather than `,` to keep thousands separators intact.
+                if let Some(last_col) = txt.trim().rsplit("\",\"").next() {
                     let digits: String = last_col.chars().filter(char::is_ascii_digit).collect();
                     if let Ok(kib) = digits.parse::<f64>() {
                         return (kib / 1024.0 * 100.0).round() / 100.0;
@@ -409,8 +411,8 @@ async fn bench_ipsec_point(
         handles.insert(name.clone(), h);
     }
 
-    // Wait for proactive MGMT link preconnect mesh to warm up so we measure pure cascade handshake.
-    tokio::time::sleep(Duration::from_millis(350)).await;
+    // Ensure proactive MGMT mesh is warmed up so we measure pure cascade handshake latency.
+    wait_mesh_warm(&pool.names, &handles, Duration::from_secs(4)).await;
 
     let mut latencies_ms = Vec::with_capacity(trials);
     let mut pkt_deltas = Vec::with_capacity(trials);
@@ -507,11 +509,13 @@ async fn bench_wireguard_point(
             route_ttl_secs: 120.0,
         };
         let mut relays = Vec::new();
+        let mut mesh_map: BTreeMap<String, OverlayNodeHandle> = BTreeMap::new();
         for relay in &pool.names[1..pool.names.len() - 1] {
             let mut cfg =
                 NodeTransportConfig::new(relay, pool.peers[relay].overlay_addr, pool.peers.clone());
             cfg.route_mode = RouteMode::Cascade;
             cfg.cascade = cascade_cfg.clone();
+            cfg.preconnect = true;
             let h = OverlayNode::start(
                 cfg,
                 pool.security_for(relay, &format!("wg{t}"))?,
@@ -519,6 +523,7 @@ async fn bench_wireguard_point(
             )
             .await
             .map_err(|e| e.to_string())?;
+            mesh_map.insert(relay.clone(), h.clone());
             relays.push(h);
         }
 
@@ -536,6 +541,7 @@ async fn bench_wireguard_point(
             NodeTransportConfig::new("B", pool.peers["B"].overlay_addr, pool.peers.clone());
         ov_b.route_mode = RouteMode::Cascade;
         ov_b.cascade = cascade_cfg.clone();
+        ov_b.preconnect = true;
         let handle_b = SplitWireGuardTunnel::start(
             WgTunnelConfig {
                 peer_name: "A".to_owned(),
@@ -544,7 +550,7 @@ async fn bench_wireguard_point(
                 wg_preshared_key: None,
                 direct_bind_addr: direct_b,
                 peer_direct_addr: direct_a,
-                persistent_keepalive_secs: Some(25),
+                persistent_keepalive_secs: None,
                 overlay: ov_b,
                 trust_registry_version: 1,
                 trust_registry_sha256: reg_sha.clone(),
@@ -559,6 +565,7 @@ async fn bench_wireguard_point(
             NodeTransportConfig::new("A", pool.peers["A"].overlay_addr, pool.peers.clone());
         ov_a.route_mode = RouteMode::Cascade;
         ov_a.cascade = cascade_cfg;
+        ov_a.preconnect = true;
         let handle_a = SplitWireGuardTunnel::start(
             WgTunnelConfig {
                 peer_name: "B".to_owned(),
@@ -567,7 +574,7 @@ async fn bench_wireguard_point(
                 wg_preshared_key: None,
                 direct_bind_addr: direct_a,
                 peer_direct_addr: direct_b,
-                persistent_keepalive_secs: Some(25),
+                persistent_keepalive_secs: None,
                 overlay: ov_a,
                 trust_registry_version: 1,
                 trust_registry_sha256: reg_sha,
@@ -578,7 +585,9 @@ async fn bench_wireguard_point(
         .await
         .map_err(|e| e.code().to_owned())?;
 
-        tokio::time::sleep(Duration::from_millis(350)).await;
+        mesh_map.insert("A".to_owned(), handle_a.overlay_handle().clone());
+        mesh_map.insert("B".to_owned(), handle_b.overlay_handle().clone());
+        wait_mesh_warm(&pool.names, &mesh_map, Duration::from_secs(4)).await;
 
         let all_handles = || {
             relays
@@ -705,6 +714,31 @@ fn build_point(
         f4_compromise_pct: f4_c.compromise_prob.map(|p| round2(p * 100.0)),
         f3_entropy_bits: f3_e.h_uniform_bits.map(round2),
         f4_entropy_bits: f4_e.h_uniform_bits.map(round2),
+    }
+}
+
+async fn wait_mesh_warm(
+    names: &[String],
+    handles: &BTreeMap<String, OverlayNodeHandle>,
+    timeout: Duration,
+) {
+    let deadline = tokio::time::Instant::now() + timeout;
+    loop {
+        let mut all_ready = true;
+        'outer: for a in names {
+            if let Some(ha) = handles.get(a) {
+                for b in names {
+                    if a < b && !ha.has_session(b).await {
+                        all_ready = false;
+                        break 'outer;
+                    }
+                }
+            }
+        }
+        if all_ready || tokio::time::Instant::now() >= deadline {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(30)).await;
     }
 }
 

@@ -416,16 +416,17 @@ impl SplitWireGuardTunnel {
                                             info!(peer = %shared_in.peer_name, %src, "updated authenticated WG direct NAT endpoint");
                                             *addr_guard = src;
                                         }
+                                        shared_in.telemetry.update(|s| {
+                                            s.direct_data_rx = s.direct_data_rx.saturating_add(1);
+                                            s.direct_bytes_rx =
+                                                s.direct_bytes_rx.saturating_add(n as u64);
+                                            if s.state != TunnelState::ConnectedDirectData {
+                                                s.state = TunnelState::ConnectedDirectData;
+                                            }
+                                        });
+                                    } else {
+                                        debug!(peer = %shared_in.peer_name, %src, len = n, "ignored unauthenticated/stale direct WG type 4 datagram");
                                     }
-
-                                    shared_in.telemetry.update(|s| {
-                                        s.direct_data_rx = s.direct_data_rx.saturating_add(1);
-                                        s.direct_bytes_rx =
-                                            s.direct_bytes_rx.saturating_add(n as u64);
-                                        if s.state != TunnelState::ConnectedDirectData {
-                                            s.state = TunnelState::ConnectedDirectData;
-                                        }
-                                    });
 
                                     for out_pkt in net_out {
                                         let _ = shared_in.outbound_wg_tx.try_send(out_pkt);

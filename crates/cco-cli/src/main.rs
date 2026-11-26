@@ -1008,7 +1008,12 @@ async fn run_wg_tunnel(args: WgTunnelArgs) -> Result<(), String> {
 
     if args.initiate {
         tokio::time::sleep(std::time::Duration::from_millis(600)).await;
-        let _ = handle.initiate_handshake().await;
+        let current = handle.stats();
+        if current.state != cco_wg_tunnel::TunnelState::ConnectedDirectData
+            && current.overlay_handshake_tx == 0
+        {
+            let _ = handle.initiate_handshake().await;
+        }
     }
 
     let stats_path = args.stats_out.clone();

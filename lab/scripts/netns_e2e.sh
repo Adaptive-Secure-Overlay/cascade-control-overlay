@@ -22,6 +22,11 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 CCO_BIN="${CCO_BIN:-$(command -v cco || true)}"
 CHARON_BIN="${CHARON_BIN:-/usr/lib/ipsec/charon}"
 OVERLAY_PORT="${OVERLAY_PORT:-9000}"
+CCO_ROUTE_MODE="${CCO_ROUTE_MODE:-mcc2}"
+CCO_HOPS="${CCO_HOPS:-3}"
+CCO_MAX_HOPS="${CCO_MAX_HOPS:-16}"
+CCO_HOP_MODEL="${CCO_HOP_MODEL:-f4}"
+CCO_PARALLEL_CHAINS="${CCO_PARALLEL_CHAINS:-2}"
 
 if [[ -z "$CCO_BIN" || ! -x "$CCO_BIN" ]]; then
   echo "ERROR: cco binary not found; build with 'cargo build --release -p cco-cli' and set CCO_BIN" >&2
@@ -168,6 +173,11 @@ start_cco() {
     --signing-key "$WORKDIR/keys/${node}/signing.key" \
     --encryption-key "$WORKDIR/keys/${node}/encryption.key" \
     --replay-db "$WORKDIR/db/${node}.sqlite" \
+    --route-mode "$CCO_ROUTE_MODE" \
+    --hops "$CCO_HOPS" \
+    --max-hops "$CCO_MAX_HOPS" \
+    --hop-model "$CCO_HOP_MODEL" \
+    --parallel-chains "$CCO_PARALLEL_CHAINS" \
     --mode first \
     --x1-fanout 2 \
     --x2-fanout 2 \
