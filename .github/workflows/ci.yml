@@ -86,9 +86,17 @@ jobs:
       - name: Install strongSwan, nftables, and tcpdump
         run: |
           sudo apt-get update
-          sudo apt-get install -y --no-install-recommends \
+          sudo apt-get install -y \
             strongswan strongswan-swanctl strongswan-charon \
+            libstrongswan-standard-plugins \
             nftables iproute2 tcpdump iputils-ping openssl
+          # Ubuntu 24.04 enforces AppArmor profiles for charon/swanctl that deny
+          # reading ephemeral lab configs from /tmp; unload them on the CI runner.
+          for profile in /etc/apparmor.d/usr.lib.ipsec.charon /etc/apparmor.d/usr.sbin.swanctl; do
+            if [ -f "$profile" ]; then
+              sudo apparmor_parser -R "$profile" 2>/dev/null || true
+            fi
+          done
       - name: Build release cco binary
         run: cargo build --release -p cco-cli
       - name: Run live 4-node strongSwan overlay verification
@@ -101,6 +109,5 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: rustsec/audit-check@v2
-        with:
-          token: ${{ secrets.GITHUB_TOKEN }}
+      - uses: taiki-e/install-action@cargo-audit
+      - run: cargo audit

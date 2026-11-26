@@ -1,0 +1,8 @@
+[advisories]
+ignore = [
+    # rsa 0.9 is used exclusively in `cco-analytics` as an offline local benchmark
+    # baseline reproducing Dissertation Table 4.6 (demonstrating why X25519+HKDF+AES-GCM
+    # replaces RSA-3072). It is never invoked on the network or by cco-crypto / cco-trust /
+    # cco-cascade / cco-transport.
+    "RUSTSEC-2023-0071",
+]

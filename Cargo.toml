@@ -44,7 +44,7 @@ rand = { version = "0.8", features = ["small_rng"] }
 rand_core = { version = "0.6", features = ["getrandom"] }
 rayon = "1.10"
 rsa = { version = "0.9", features = ["sha2"] }
-rusqlite = { version = "0.32", features = ["bundled"] }
+rusqlite = { version = "0.43", features = ["bundled"] }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 sha2 = "0.10"

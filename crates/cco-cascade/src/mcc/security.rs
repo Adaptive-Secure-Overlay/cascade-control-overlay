@@ -865,9 +865,11 @@ impl EndpointSecurity {
             "PRAGMA foreign_keys=ON; PRAGMA synchronous=FULL; PRAGMA trusted_schema=OFF;",
         )
         .map_err(|_| CascadeError::new("state_unavailable"))?;
-        let page_size: u64 = conn
+        let page_size_raw: i64 = conn
             .query_row("PRAGMA page_size", [], |r| r.get(0))
             .map_err(|_| CascadeError::new("state_unavailable"))?;
+        let page_size =
+            u64::try_from(page_size_raw).map_err(|_| CascadeError::new("state_unavailable"))?;
         let max_pages = (MAX_LEDGER_BYTES / page_size.max(512)).max(1);
         conn.execute_batch(&format!("PRAGMA max_page_count={max_pages};"))
             .map_err(|_| CascadeError::new("state_unavailable"))?;

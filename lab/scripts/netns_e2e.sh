@@ -43,7 +43,17 @@ WORKDIR="$(mktemp -d /tmp/cco-netns-lab.XXXXXX)"
 PIDS=()
 
 cleanup() {
+  local rc=$?
   set +e
+  if [[ "$rc" -ne 0 && -d "$WORKDIR/logs" ]]; then
+    echo "=== netns_e2e.sh failed (exit=$rc); diagnostic logs ===" >&2
+    for f in "$WORKDIR"/logs/*.stdout "$WORKDIR"/logs/*.log; do
+      if [[ -s "$f" ]]; then
+        echo "--- $(basename "$f") ---" >&2
+        tail -n 30 "$f" >&2
+      fi
+    done
+  fi
   for pid in "${PIDS[@]}"; do
     kill "$pid" 2>/dev/null || true
   done
@@ -212,8 +222,9 @@ charon {
 }
 CONF
 
-  umask 077
-  cat >"$WORKDIR/swanctl-${node}.conf" <<SWAN
+  (
+    umask 077
+    cat >"$WORKDIR/swanctl-${node}.conf" <<SWAN
 connections {
   overlay-ike {
     version = 2
@@ -248,6 +259,7 @@ secrets {
   }
 }
 SWAN
+  )
 }
 
 write_strongswan_cfg A 192.0.2.10 192.0.2.13 198.51.100.10/32 198.51.100.13/32 node-a.example node-b.example
