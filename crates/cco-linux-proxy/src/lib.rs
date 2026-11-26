@@ -69,6 +69,8 @@ mod tests {
         let nft = render_nftables_rules(&cfg);
         assert!(nft.contains("priority -100; policy accept;"));
         assert!(nft.contains("meta mark 0x53 notrack"));
+        assert!(nft.contains("udp dport 4500 @th,64,32 != 0x00000000 notrack"));
+        assert!(nft.contains("udp dport 4500 udp length 9 notrack"));
         assert!(nft.contains("meta mark 0x53 return"));
         assert!(nft.contains("@th,64,32 0x00000000 redirect to :15202"));
         assert!(nft.contains("ip daddr 192.0.2.2 udp dport 500 redirect to :15102"));

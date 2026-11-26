@@ -100,6 +100,25 @@ pub fn render_nftables_rules(config: &IkeProxyConfig) -> String {
     out.push_str(&format!(
         "add rule inet ikeproxy output_raw meta mark {mark_hex} notrack\n"
     ));
+    for spec in &config.capture_specs {
+        if spec.ike_port != 4500 {
+            continue;
+        }
+        let Some(ref peer_name) = spec.dst_user_hint else {
+            continue;
+        };
+        let Some(&peer_ip) = config.peer_ips.get(peer_name) else {
+            continue;
+        };
+        // Keep NAT-T ESP-in-UDP (non-zero SPI) and 1-byte NAT-T keepalives (udp len 9)
+        // untracked so conntrack never sticks them to an earlier IKE_AUTH :4500 redirect!
+        out.push_str(&format!(
+            "add rule inet ikeproxy output_raw ip daddr {peer_ip} udp dport 4500 @th,64,32 != 0x00000000 notrack\n"
+        ));
+        out.push_str(&format!(
+            "add rule inet ikeproxy output_raw ip daddr {peer_ip} udp dport 4500 udp length 9 notrack\n"
+        ));
+    }
     out.push_str(&format!(
         "add rule inet ikeproxy output meta mark {mark_hex} return\n"
     ));
